@@ -60,7 +60,8 @@ def aplicar_pareto(
     df: pd.DataFrame,
     col_valor: str = "VALOR DEBITADO O ACREDITADO",
     pareto_umbral: float = 80.0,
-    top_max: int = 1000,
+    top_max: Optional[int] = 1000,
+    filtrar_solo_80: bool = False,
 ) -> Tuple[pd.DataFrame, dict]:
     """
     Calcula el valor absoluto, ordena de mayor a menor y extrae la muestra Pareto
@@ -85,41 +86,44 @@ def aplicar_pareto(
     # Filtrar registros con valor cero
     df_proc = df_proc[df_proc["VALOR_ABSOLUTO"] > 0].copy()
 
-    # Ordenar de mayor a menor valor
+    # Ordenar de mayor a menor valor (Pareto)
     df_proc = df_proc.sort_values(by="VALOR_ABSOLUTO", ascending=False).reset_index(drop=True)
 
     # Cálculo de métricas de Pareto
     valor_total_poblacion = df_proc["VALOR_ABSOLUTO"].sum()
+    df_proc["ORDEN_PARETO"] = range(1, len(df_proc) + 1)
     df_proc["PORCENTAJE_INDIVIDUAL"] = (df_proc["VALOR_ABSOLUTO"] / valor_total_poblacion) * 100.0
     df_proc["PORCENTAJE_ACUMULADO"] = (
         df_proc["VALOR_ABSOLUTO"].cumsum() / valor_total_poblacion
     ) * 100.0
 
-    # Condición de corte Pareto (el registro que cruza el 80% se incluye)
-    filtro_80 = df_proc["PORCENTAJE_ACUMULADO"].shift(1, fill_value=0.0) < pareto_umbral
-    df_pareto = df_proc[filtro_80].copy()
+    # Marcar transacciones pertenecientes al núcleo 80% (Pareto de alta materialidad)
+    df_proc["ES_PARETO_80"] = (
+        df_proc["PORCENTAJE_ACUMULADO"].shift(1, fill_value=0.0) < pareto_umbral
+    )
 
-    # Si la cantidad sobrepasa top_max o se requiere limitar a top 1000:
-    if len(df_pareto) > top_max:
-        logger.info(f"Limitando muestra a los primeros {top_max} registros.")
-        df_pareto = df_proc.head(top_max).copy()
-    elif len(df_pareto) < top_max and len(df_proc) >= top_max:
-        # Si el 80% fue alcanzado en menos de top_max registros, se mantiene el 80%
-        # pero se deja constancia
-        pass
+    # Si se solicitó explícitamente recortar solo al 80%:
+    if filtrar_solo_80:
+        df_salida = df_proc[df_proc["ES_PARETO_80"]].copy()
+        if top_max and len(df_salida) > top_max:
+            df_salida = df_proc.head(top_max).copy()
+    else:
+        # Por defecto: TODO el universo contable ordenado por Pareto de mayor a menor
+        df_salida = df_proc
 
-    valor_muestra = df_pareto["VALOR_ABSOLUTO"].sum()
+    valor_muestra = df_salida["VALOR_ABSOLUTO"].sum()
     pct_cobertura = (valor_muestra / valor_total_poblacion) * 100.0
 
     estadisticas = {
         "total_registros_poblacion": len(df),
-        "total_registros_muestra": len(df_pareto),
+        "total_registros_base": len(df_salida),
+        "total_registros_pareto_80": int(df_proc["ES_PARETO_80"].sum()),
         "valor_total_poblacion": valor_total_poblacion,
-        "valor_total_muestra": valor_muestra,
+        "valor_total_base": valor_muestra,
         "porcentaje_cobertura": pct_cobertura,
     }
 
-    return df_pareto, estadisticas
+    return df_salida, estadisticas
 
 
 def normalizar_columnas_clave(df: pd.DataFrame) -> pd.DataFrame:
@@ -168,9 +172,10 @@ def ejecutar_analisis_pareto(
     ruta_entrada: Optional[Path] = None,
     ruta_salida: Optional[Path] = None,
     umbral_pct: float = 80.0,
-    top_max: int = 1000,
+    top_max: Optional[int] = 1000,
+    filtrar_solo_80: bool = False,
 ) -> Path:
-    """Ejecuta el flujo completo de selección Pareto y guarda el archivo CSV."""
+    """Ejecuta el flujo completo de ordenación Pareto sobre toda la universalidad."""
     base_dir = Path(__file__).resolve().parent.parent
 
     if ruta_entrada is None:
@@ -190,8 +195,13 @@ def ejecutar_analisis_pareto(
     # 1. Cargar datos
     df_raw = cargar_universalidad(ruta_entrada)
 
-    # 2. Aplicar Pareto
-    df_pareto, stats = aplicar_pareto(df_raw, pareto_umbral=umbral_pct, top_max=top_max)
+    # 2. Aplicar Pareto (toda la población ordenada de mayor a menor)
+    df_pareto, stats = aplicar_pareto(
+        df_raw,
+        pareto_umbral=umbral_pct,
+        top_max=top_max,
+        filtrar_solo_80=filtrar_solo_80,
+    )
 
     # 3. Normalizar columnas clave para downstream
     df_final = normalizar_columnas_clave(df_pareto)
@@ -199,17 +209,26 @@ def ejecutar_analisis_pareto(
     # 4. Guardar archivo
     df_final.to_csv(ruta_salida, index=False, encoding="utf-8-sig")
 
-    logger.info("=" * 60)
-    logger.info("RESUMEN SELECCIÓN MUESTRAL PARETO:")
-    logger.info(f" - Registros en población: {stats['total_registros_poblacion']:,}")
-    logger.info(f" - Registros seleccionados: {stats['total_registros_muestra']:,}")
-    logger.info(f" - Valor total auditado:   ${stats['valor_total_muestra']:,.2f} COP")
-    logger.info(f" - Cobertura sobre total:  {stats['porcentaje_cobertura']:.2f}%")
-    logger.info(f" - Archivo generado en:    {ruta_salida}")
-    logger.info("=" * 60)
+    logger.info("=" * 65)
+    logger.info("RESUMEN DE POBLACIÓN UNIVERSALIDAD ORDENADA POR PARETO:")
+    logger.info(f" - Registros totales en población:  {stats['total_registros_poblacion']:,}")
+    logger.info(f" - Registros incluidos en base:     {stats['total_registros_base']:,}")
+    logger.info(f" - Registros en núcleo Pareto 80%:  {stats['total_registros_pareto_80']:,}")
+    logger.info(f" - Monto total de la base:          ${stats['valor_total_base']:,.2f} COP")
+    logger.info(f" - Archivo generado en:             {ruta_salida}")
+    logger.info("=" * 65)
 
     return ruta_salida
 
 
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Generación de base contable universal ordenada por Pareto.")
+    parser.add_argument("--solo-80", action="store_true", help="Filtrar únicamente el 80%% de materialidad (Pareto clásico).")
+    args = parser.parse_args()
+
+    ejecutar_analisis_pareto(filtrar_solo_80=args.solo_80)
+
+
 if __name__ == "__main__":
-    ejecutar_analisis_pareto()
+    main()

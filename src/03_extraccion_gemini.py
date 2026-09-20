@@ -305,42 +305,98 @@ def procesar_lote_pdfs(
     except ImportError:
         logger.warning("Librería google-generativeai no instalada. Ejecute: pip install google-generativeai")
 
-    # Descubrir PDFs
-    archivos_pdf = sorted(list(directorio_pdfs.glob("*.pdf")))
-    logger.info(f"Total de PDFs encontrados en datalake: {len(archivos_pdf)}")
-
-    if not archivos_pdf:
-        logger.warning(f"No se encontraron archivos .pdf en '{directorio_pdfs}'.")
-        return pd.DataFrame()
-
-    if max_archivos and max_archivos > 0:
-        logger.info(f"Limitando procesamiento a {max_archivos} PDFs.")
-        archivos_pdf = archivos_pdf[:max_archivos]
-
-    # Cargar resultados previos si existen para asegurar idempotencia
-    registros_previos: Dict[str, Dict[str, Any]] = {}
+    # 1. Cargar resultados previos para asegurar idempotencia y conservar trabajo realizado
+    registros_existentes: Dict[str, Dict[str, Any]] = {}
     if ruta_salida_csv.exists():
         try:
-            df_existente = pd.read_csv(ruta_salida_csv)
+            df_existente = pd.read_csv(ruta_salida_csv, dtype={"NUMERO_OP": str})
             for _, r in df_existente.iterrows():
                 op_prev = str(r.get("NUMERO_OP", "")).strip()
-                if op_prev:
-                    registros_previos[op_prev] = r.to_dict()
-            logger.info(f"Cargados {len(registros_previos)} registros procesados previamente desde '{ruta_salida_csv.name}'.")
+                if op_prev and op_prev not in ["nan", "None"]:
+                    registros_existentes[op_prev] = r.to_dict()
+            logger.info(f"Cargados {len(registros_existentes):,} análisis previos desde '{ruta_salida_csv.name}'.")
         except Exception as e_read:
             logger.warning(f"No se pudo leer archivo previo de resultados: {e_read}")
 
-    resultados: List[Dict[str, Any]] = []
+    # 2. Mapear PDFs disponibles en datalake
+    pdfs_en_datalake: Dict[str, Path] = {}
+    for p in directorio_pdfs.glob("*.pdf"):
+        if p.stat().st_size > 1024:
+            op_num = extraer_numero_op_de_nombre(p.name)
+            if op_num:
+                pdfs_en_datalake[op_num] = p
 
-    for idx, ruta_pdf in enumerate(archivos_pdf, 1):
-        op_id = extraer_numero_op_de_nombre(ruta_pdf.name)
-        logger.info(f"[{idx}/{len(archivos_pdf)}] Procesando soporte OP {op_id} ('{ruta_pdf.name}')...")
+    logger.info(f"Total de PDFs válidos disponibles en datalake: {len(pdfs_en_datalake):,}")
 
-        # Verificar si ya fue procesado
-        if op_id in registros_previos:
-            logger.info(f" -> OP {op_id} ya procesada previamente. Reutilizando resultado.")
-            resultados.append(registros_previos[op_id])
-            continue
+    if not pdfs_en_datalake:
+        logger.warning(f"No se encontraron archivos .pdf en '{directorio_pdfs}'. Ejecute primero '02_descargar_soportes.py'.")
+        return pd.DataFrame()
+
+    # 3. Construir cola de análisis en ESTRICTO ORDEN PARETO (mayor valor primero)
+    ruta_pareto = base_dir / "data" / "output" / "base_auditoria_pareto.csv"
+    cola_pendientes: List[Dict[str, Any]] = []
+    ops_en_cola = set()
+
+    if ruta_pareto.exists():
+        logger.info(f"Priorizando análisis según orden Pareto de '{ruta_pareto.name}'...")
+        df_pareto = pd.read_csv(ruta_pareto, dtype={"OP_LIMPIA": str, "NUMERO OP": str})
+        col_op = "OP_LIMPIA" if "OP_LIMPIA" in df_pareto.columns else "NUMERO OP"
+
+        for _, fila in df_pareto.iterrows():
+            op_val = str(fila.get(col_op, "")).strip().replace(".0", "")
+            if op_val in pdfs_en_datalake and op_val not in ops_en_cola:
+                ops_en_cola.add(op_val)
+                # Solo encolar si NO ha sido analizado previamente
+                if op_val not in registros_existentes:
+                    cola_pendientes.append({
+                        "op_id": op_val,
+                        "ruta_pdf": pdfs_en_datalake[op_val],
+                        "valor": fila.get("VALOR_ABSOLUTO", 0.0),
+                        "orden_pareto": fila.get("ORDEN_PARETO", len(cola_pendientes) + 1),
+                        "tercero": fila.get("TERCERO", ""),
+                    })
+
+    # Agregar cualquier PDF huérfano en datalake que no esté en la base Pareto
+    for op_num, ruta_pdf in pdfs_en_datalake.items():
+        if op_num not in ops_en_cola:
+            ops_en_cola.add(op_num)
+            if op_num not in registros_existentes:
+                cola_pendientes.append({
+                    "op_id": op_num,
+                    "ruta_pdf": ruta_pdf,
+                    "valor": 0.0,
+                    "orden_pareto": 999999,
+                    "tercero": "PDF sin cruce en Pareto",
+                })
+
+    logger.info("=" * 65)
+    logger.info("ESTADO ACTUAL DE DIGITALIZACIÓN Y EXTRACCIÓN (ORDEN PARETO):")
+    logger.info(f" - OPs ya analizadas con Gemini:       {len(registros_existentes):,}")
+    logger.info(f" - OPs con PDF pendientes de análisis: {len(cola_pendientes):,}")
+    logger.info("=" * 65)
+
+    if not cola_pendientes:
+        logger.info("[TODO AL DÍA] ¡Todos los PDFs del datalake ya han sido analizados por Gemini!")
+        return pd.DataFrame(list(registros_existentes.values()))
+
+    # Aplicar tamaño de lote
+    if max_archivos and max_archivos > 0:
+        lote_a_procesar = cola_pendientes[:max_archivos]
+        logger.info(f"[LOTE SELECCIONADO] Procesando las siguientes {len(lote_a_procesar)} OPs pendientes de mayor valor.")
+    else:
+        lote_a_procesar = cola_pendientes
+        logger.info(f"[LOTE COMPLETO] Procesando la totalidad de las {len(lote_a_procesar)} OPs pendientes.")
+
+    for pos, item in enumerate(lote_a_procesar, 1):
+        op_id = item["op_id"]
+        ruta_pdf = item["ruta_pdf"]
+        valor_str = f"${item['valor']:,.0f}" if item['valor'] > 0 else ""
+        orden_str = f"Pareto #{item['orden_pareto']}" if item['orden_pareto'] < 999999 else "Soporte adicional"
+
+        logger.info(
+            f"[{pos}/{len(lote_a_procesar)}] ({orden_str} {valor_str}) "
+            f"Analizando OP {op_id} ('{ruta_pdf.name}')..."
+        )
 
         try:
             # 1. Rasterizar a imágenes
@@ -352,14 +408,13 @@ def procesar_lote_pdfs(
                 resp_texto = llamar_gemini_con_backoff(model, PROMPT_AUDITORIA, imagenes)
                 datos_extraidos = parsear_respuesta_gemini(resp_texto)
             else:
-                # Modo simulación / offline si aún no se ha provisto API Key válida
                 logger.info(" -> Modo simulación (sin API Key activa): extrayendo metadata base.")
                 datos_extraidos = {
                     "numero_factura_op": f"OP-{op_id}",
-                    "emisor_nombre": "PENDIENTE_API_KEY",
+                    "emisor_nombre": item.get("tercero") or "EMISOR_BASE",
                     "emisor_nit": "",
                     "concepto_pago": f"Soporte documental OP {op_id}",
-                    "valor_total": 0.0,
+                    "valor_total": float(item.get("valor", 0.0)),
                     "categoria_contractual": "AR7" if int(op_id) % 2 == 0 else "AR8",
                     "requiere_acta_interventoria": (int(op_id) % 2 == 0),
                     "es_parte_relacionada": False,
@@ -380,19 +435,16 @@ def procesar_lote_pdfs(
                 "JUSTIFICACION": datos_extraidos.get("justificacion_clasificacion"),
             }
 
-            resultados.append(registro)
-            registros_previos[op_id] = registro
-
-            # Guardado progresivo en cada iteración
-            df_actual = pd.DataFrame(resultados)
+            # Guardado acumulativo inmediato
+            registros_existentes[op_id] = registro
+            df_actual = pd.DataFrame(list(registros_existentes.values()))
             df_actual.to_csv(ruta_salida_csv, index=False, encoding="utf-8-sig")
 
-            # Pausa de cortesía entre llamadas a la API
+            # Pausa de cortesía entre llamadas
             time.sleep(1.0)
 
         except Exception as e_proc:
             logger.error(f"Error procesando PDF '{ruta_pdf.name}': {e_proc}")
-            # Guardar registro con error
             registro_error = {
                 "NUMERO_OP": op_id,
                 "ARCHIVO_PDF": ruta_pdf.name,
@@ -406,30 +458,30 @@ def procesar_lote_pdfs(
                 "ES_PARTE_RELACIONADA": False,
                 "JUSTIFICACION": f"Fallo en rasterización o API: {e_proc}",
             }
-            resultados.append(registro_error)
+            registros_existentes[op_id] = registro_error
+            df_actual = pd.DataFrame(list(registros_existentes.values()))
+            df_actual.to_csv(ruta_salida_csv, index=False, encoding="utf-8-sig")
 
-    df_final = pd.DataFrame(resultados)
-    df_final.to_csv(ruta_salida_csv, index=False, encoding="utf-8-sig")
-
-    logger.info("=" * 60)
+    df_final = pd.DataFrame(list(registros_existentes.values()))
+    logger.info("=" * 65)
     logger.info("RESUMEN DE EXTRACCIÓN Y CLASIFICACIÓN GEMINI:")
-    logger.info(f" - Total PDFs analizados: {len(df_final)}")
-    logger.info(f" - Archivo generado:     {ruta_salida_csv}")
+    logger.info(f" - Total acumulado de OPs analizadas: {len(df_final):,}")
+    logger.info(f" - Archivo consolidado en:           {ruta_salida_csv}")
     if not df_final.empty and "CATEGORIA_CONTRACTUAL" in df_final.columns:
         conteo_cat = df_final["CATEGORIA_CONTRACTUAL"].value_counts().to_dict()
-        logger.info(f" - Desglose por categoría: {conteo_cat}")
-    logger.info("=" * 60)
+        logger.info(f" - Desglose acumulado por categoría: {conteo_cat}")
+    logger.info("=" * 65)
 
     return df_final
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extracción y clasificación multimodal de soportes con Gemini.")
+    parser = argparse.ArgumentParser(description="Extracción y clasificación multimodal de soportes con Gemini en orden Pareto.")
     parser.add_argument("--modelo", type=str, default=None, help="Nombre del modelo Gemini (ej. gemini-2.5-flash).")
-    parser.add_argument("--limite", type=int, default=None, help="Límite máximo de PDFs a procesar.")
+    parser.add_argument("--lote", "--limite", dest="lote", type=int, default=None, help="Cantidad de PDFs pendientes a procesar en este lote (en orden Pareto).")
     args = parser.parse_args()
 
-    procesar_lote_pdfs(modelo_nombre=args.modelo, max_archivos=args.limite)
+    procesar_lote_pdfs(modelo_nombre=args.modelo, max_archivos=args.lote)
 
 
 if __name__ == "__main__":

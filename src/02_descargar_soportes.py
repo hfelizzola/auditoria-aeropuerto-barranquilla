@@ -277,7 +277,7 @@ def descargar_soportes(
             f"Ejecute primero '01_pareto_universalidad.py'."
         )
 
-    logger.info(f"Leyendo muestra desde '{ruta_csv}'...")
+    logger.info(f"Leyendo universo contable desde '{ruta_csv}'...")
     df = pd.read_csv(ruta_csv, dtype={"OP_LIMPIA": str, "NUMERO OP": str})
 
     # Identificar columnas
@@ -286,15 +286,53 @@ def descargar_soportes(
 
     logger.info(f"Usando columna de enlace: '{col_enlace}' y columna de OP: '{col_op}'.")
 
-    df_descargas = df.dropna(subset=[col_enlace]).copy()
-    df_descargas = df_descargas[df_descargas[col_enlace].astype(str).str.strip() != ""]
+    # Limpiar y deduplicar en estricto orden Pareto (conservando la primera aparición = mayor valor)
+    df_validos = df.dropna(subset=[col_enlace]).copy()
+    df_validos = df_validos[df_validos[col_enlace].astype(str).str.strip().str.startswith(("http://", "https://"))]
+    df_validos["OP_ID"] = df_validos[col_op].apply(sanitizar_nombre_op)
+    df_validos = df_validos.dropna(subset=["OP_ID"]).drop_duplicates(subset=["OP_ID"], keep="first")
 
+    total_ops_unicas = len(df_validos)
+    logger.info(f"Total de Órdenes de Pago únicas con enlace identificadas: {total_ops_unicas:,}")
+
+    # Clasificar entre las ya descargadas en datalake y las pendientes
+    ops_pendientes = []
+    ops_existentes = 0
+
+    for _, fila in df_validos.iterrows():
+        op_id = fila["OP_ID"]
+        archivo_esperado = directorio_destino / f"OP_{op_id}.pdf"
+        if archivo_esperado.exists() and archivo_esperado.stat().st_size > 1024:
+            ops_existentes += 1
+        else:
+            ops_pendientes.append(fila)
+
+    logger.info("=" * 65)
+    logger.info("ESTADO ACTUAL DEL DATALAKE (ORDEN PARETO):")
+    logger.info(f" - Soportes ya descargados en disco: {ops_existentes:,}")
+    logger.info(f" - Soportes pendientes de descarga:   {len(ops_pendientes):,}")
+    logger.info("=" * 65)
+
+    if not ops_pendientes:
+        logger.info("[TODO AL DÍA] ¡Todos los soportes documentales ya están descargados en el datalake local!")
+        return {
+            "total": total_ops_unicas,
+            "ya_existian": ops_existentes,
+            "descargados": 0,
+            "recuperados_local": 0,
+            "fallidos": 0,
+        }
+
+    # Aplicar tamaño de lote definido por el usuario
     if limite is not None and limite > 0:
-        logger.info(f"Aplicando límite de prueba: {limite} descargas.")
-        df_descargas = df_descargas.head(limite)
+        lote_a_procesar = ops_pendientes[:limite]
+        logger.info(f"[LOTE SELECCIONADO] Procesando las siguientes {len(lote_a_procesar)} OPs pendientes de mayor valor.")
+    else:
+        lote_a_procesar = ops_pendientes
+        logger.info(f"[LOTE COMPLETO] Procesando la totalidad de las {len(lote_a_procesar)} OPs pendientes.")
 
     # Obtener el dominio del sitio SharePoint del primer enlace disponible
-    primer_enlace = df_descargas[col_enlace].iloc[0]
+    primer_enlace = lote_a_procesar[0][col_enlace]
     parsed_url = urlparse(primer_enlace)
     dominio_sitio = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
@@ -307,44 +345,26 @@ def descargar_soportes(
     )
 
     stats = {
-        "total": len(df_descargas),
+        "total_lote": len(lote_a_procesar),
         "descargados": 0,
-        "ya_existian": 0,
+        "ya_existian": ops_existentes,
         "recuperados_local": 0,
         "fallidos": 0,
-        "omitidos_sin_op": 0,
     }
 
-    ops_procesadas = set()
-
-    for idx, fila in df_descargas.iterrows():
-        op_raw = fila.get(col_op)
-        op_id = sanitizar_nombre_op(op_raw)
-
-        if not op_id:
-            stats["omitidos_sin_op"] += 1
-            continue
-
+    for pos, fila in enumerate(lote_a_procesar, 1):
+        op_id = fila["OP_ID"]
         url = str(fila[col_enlace]).strip()
-        if not url.startswith("http://") and not url.startswith("https://"):
-            stats["fallidos"] += 1
-            continue
-
-        if op_id in ops_procesadas:
-            continue
-        ops_procesadas.add(op_id)
+        monto_str = f"${fila.get('VALOR_ABSOLUTO', 0):,.0f}" if 'VALOR_ABSOLUTO' in fila else ""
+        orden_pareto = fila.get("ORDEN_PARETO", pos)
 
         nombre_archivo_destino = f"OP_{op_id}.pdf"
         ruta_archivo_destino = directorio_destino / nombre_archivo_destino
 
-        # 1. Comprobar si ya existe en datalake
-        if ruta_archivo_destino.exists() and ruta_archivo_destino.stat().st_size > 1024:
-            logger.info(f"[EXISTE] OP {op_id}: '{nombre_archivo_destino}' ya existe en datalake.")
-            stats["ya_existian"] += 1
-            continue
-
-        # 2. Descargar con sesión autenticada
-        logger.info(f"[DESCARGANDO] OP {op_id} desde {url[:75]}...")
+        logger.info(
+            f"[{pos}/{len(lote_a_procesar)}] (Pareto #{orden_pareto} {monto_str}) "
+            f"Descargando OP {op_id}..."
+        )
         descarga_exitosa = False
 
         try:
@@ -397,28 +417,28 @@ def descargar_soportes(
 
     logger.info("=" * 65)
     logger.info("RESUMEN DE DESCARGA DE SOPORTES:")
-    logger.info(f" - Total OPs procesadas:    {len(ops_procesadas):,}")
-    logger.info(f" - Descargadas vía Web:     {stats['descargados']:,}")
-    logger.info(f" - Ya existentes en disco:  {stats['ya_existian']:,}")
-    logger.info(f" - Recuperadas de respaldo: {stats['recuperados_local']:,}")
-    logger.info(f" - Pendientes / Fallidas:   {stats['fallidos']:,}")
-    logger.info(f" - Directorio destino:      {directorio_destino}")
+    logger.info(f" - Total OPs en este lote:    {len(lote_a_procesar):,}")
+    logger.info(f" - Descargadas vía Web:       {stats['descargados']:,}")
+    logger.info(f" - Ya existentes en disco:    {stats['ya_existian']:,}")
+    logger.info(f" - Recuperadas de respaldo:   {stats['recuperados_local']:,}")
+    logger.info(f" - Pendientes / Fallidas:     {stats['fallidos']:,}")
+    logger.info(f" - Directorio destino:        {directorio_destino}")
     logger.info("=" * 65)
 
     return stats
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Descarga autenticada de soportes PDF desde SharePoint.")
+    parser = argparse.ArgumentParser(description="Descarga autenticada de soportes PDF desde SharePoint por lotes en orden Pareto.")
     parser.add_argument("--usuario", type=str, default=None, help="Usuario o correo de SharePoint / Microsoft 365.")
     parser.add_argument("--password", type=str, default=None, help="Contraseña de SharePoint.")
     parser.add_argument("--fedauth", type=str, default=None, help="Cookie de sesión FedAuth (para cuentas con MFA).")
-    parser.add_argument("--limite", type=int, default=100, help="Límite de archivos a procesar para pruebas.")
+    parser.add_argument("--lote", "--limite", dest="lote", type=int, default=None, help="Cantidad de OPs pendientes a descargar en este lote (en orden Pareto).")
     parser.add_argument("--pausa", type=float, default=1.0, help="Pausa en segundos entre descargas (default 1.0).")
     args = parser.parse_args()
 
     descargar_soportes(
-        limite=args.limite,
+        limite=args.lote,
         pausa_segundos=args.pausa,
         usuario=args.usuario,
         contrasena=args.password,
