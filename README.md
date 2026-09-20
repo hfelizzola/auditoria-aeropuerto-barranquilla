@@ -124,3 +124,41 @@ El reporte final computa la diferencia:
 $$\text{DIFERENCIA\_VALOR} = \text{VALOR\_ABSOLUTO (Contabilidad)} - \text{VALOR\_TOTAL\_EXTRAIDO (Factura)}$$
 Permitiendo a los auditores identificar inmediatamente glosas, retenciones tributarias no conciliadas o desviaciones entre el giro bancario del fideicomiso y la factura comercial.
 
+---
+
+## 6. Control de Versiones y Despliegue en GitHub
+
+El proyecto cuenta con configuración para versionado seguro y pipeline de Integración Continua (CI):
+
+### Seguridad de datos y exclusiones (.gitignore)
+El archivo `.gitignore` garantiza que **NUNCA** se suban a GitHub:
+- Secretos o credenciales (`.env`).
+- Archivos Excel contables del fideicomiso (`*.xlsx`, `*.xlsm`).
+- Soportes documentales en PDF (`data/datalake_pdfs/`, `*.pdf`).
+- Informes institucionales (`*.docx`, `*.pptx`).
+
+Se incluye la plantilla pública segura [`.env.example`](.env.example) para documentar las variables requeridas.
+
+### Publicar en tu repositorio de GitHub
+
+1. **Crea un repositorio vacío** en tu cuenta de GitHub (ej. `Auditoria-Aeropuerto-Barranquilla`) sin añadir README ni .gitignore.
+2. **Ejecuta el script interactivo** de publicación:
+   ```powershell
+   .\setup_github.ps1
+   ```
+   O realiza los comandos manualmente:
+   ```powershell
+   # 1. Vincular repositorio remoto
+   git remote add origin https://github.com/TU_USUARIO/TU_REPOSITORIO.git
+
+   # 2. Subir código a la rama main
+   git push -u origin main
+   ```
+
+### Integración Continua (GitHub Actions)
+El flujo en [`.github/workflows/ci.yml`](.github/workflows/ci.yml) se ejecuta automáticamente ante cada `push` o `pull_request`:
+- Verifica la compilación y sintaxis de todos los scripts en `src/`.
+- Comprueba que `.env` no haya sido versionado por error.
+- Valida la integridad estructural de directorios.
+
+
