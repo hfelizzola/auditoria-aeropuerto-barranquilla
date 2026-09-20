@@ -1,0 +1,48 @@
+name: CI Auditoria Automatizada
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  validate:
+    name: Validar Sintaxis e Integridad de Código
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar código (Checkout)
+        uses: actions/checkout@v4
+
+      - name: Configurar entorno Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Verificar que .env no esté versionado
+        run: |
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "ERROR DE SEGURIDAD CRÍTICO: .env está rastreado en Git!"
+            exit 1
+          else
+            echo "OK: .env está debidamente excluido por .gitignore"
+          fi
+
+      - name: Verificar sintaxis de scripts Python (py_compile)
+        run: |
+          python -m py_compile src/*.py
+          echo "Todos los scripts en src/ compilan correctamente."
+
+      - name: Verificar existencia de estructura de carpetas
+        run: |
+          test -d data/raw || exit 1
+          test -d data/datalake_pdfs || exit 1
+          test -d data/output || exit 1
+          echo "Estructura de directorios /data validada."

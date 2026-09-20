@@ -1,0 +1,83 @@
+# ==============================================================================
+# .gitignore - Proyecto Auditoría Automatizada Concesión Aeropuerto
+# ==============================================================================
+
+# 1. Seguridad y Secretos (NUNCA SUBIR A GITHUB)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.token
+*.pfx
+
+# 2. Datos Masivos y Documentos del Concesionario / Fideicomiso
+data/raw/*
+!data/raw/.gitkeep
+data/datalake_pdfs/*
+!data/datalake_pdfs/.gitkeep
+data/output/*
+!data/output/.gitkeep
+
+# Exclusiones globales de archivos binarios pesados o confidenciales
+*.xlsx
+*.xlsm
+*.xls
+*.pdf
+*.docx
+*.pptx
+*.zip
+*.rar
+*.7z
+*.sqlite
+*.sqlite3
+*.db
+
+# 3. Entornos Virtuales de Python
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# 4. Caché y Artefactos de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 5. Configuración de Editores e IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.project
+.pydevproject
+
+# 6. Archivos del Sistema Operativo
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.Spotlight-V100
+.Trashes
