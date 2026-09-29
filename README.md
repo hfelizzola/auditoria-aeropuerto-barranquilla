@@ -1,7 +1,12 @@
 # Automatización de Auditoría Contable - Concesión Aeropuerto Ernesto Cortissoz
-## Fiscalización y Liquidación Contractual bajo el Numeral 22.3 c) (Contrato ANI 003 de 2015)
+## Auditoría documental de la liquidación bajo el Numeral 22.3 c) (Contrato ANI 003 de 2015)
 
-Este proyecto implementa una arquitectura automatizada de analítica contable y extracción documental asistida por inteligencia artificial (Google Gemini Multimodal) para la auditoría de costos, gastos e inversiones del Patrimonio Autónomo del Aeropuerto Ernesto Cortissoz de Barranquilla.
+Este proyecto automatiza la revisión, fila por fila, de los pagos registrados en la hoja
+`UNIVERSALIDAD` del Patrimonio Autónomo del Aeropuerto Ernesto Cortissoz contra su soporte PDF
+en SharePoint, con la misma metodología y el mismo Excel de entrega que se usan en la revisión
+manual. Un solo comando selecciona el lote, descarga los soportes, extrae los hechos de cada
+documento con un modelo de visión (Gemini o Claude), cuadra valores y retenciones en Python y
+clasifica cada transacción en 5 etiquetas.
 
 ---
 
@@ -10,119 +15,208 @@ Este proyecto implementa una arquitectura automatizada de analítica contable y 
 ```text
 Auditoria Automatizada/
 ├── data/
-│   ├── raw/
-│   │   └── (A)BAS~1.xlsx             # Base contable matriz (hoja UNIVERSALIDAD)
-│   ├── datalake_pdfs/                # Datalake local de PDFs descargados (OP_{id}.pdf)
+│   ├── raw/(A)BAS~1.xlsx                 # Base contable (hoja UNIVERSALIDAD)
+│   ├── soportes/<lote>/                  # PDFs descargados por lote + _manifiesto_descarga.csv
 │   └── output/
-│       ├── base_auditoria_pareto.csv  # Muestra Pareto 80/20 de alta materialidad
-│       ├── resultados_gemini.csv      # Extracciones y clasificaciones de Gemini
-│       └── reporte_auditoria_final.csv # Dictamen contable-jurídico cruzado final
+│       ├── Validacion_Soportes_Rango…_UNIVERSALIDAD_ABAS1.xlsx   # ENTREGABLE de cada lote
+│       ├── estado/<lote>/ranks/rNNNNN.json   # checkpoints por rank (hechos, señales, clasificación)
+│       ├── estado/<lote>/pendientes_sin_resultado.csv
+│       ├── estado/<lote>/orquestador.log
+│       └── .cache/                        # copia rápida de UNIVERSALIDAD (se regenera sola)
 ├── src/
-│   ├── __init__.py
-│   ├── 01_pareto_universalidad.py    # Filtro Pareto 80/20 y selección muestral
-│   ├── 02_descargar_soportes.py      # Descarga controlada y resiliente de PDFs
-│   ├── 03_extraccion_gemini.py       # Rasterizado en memoria (150 DPI) y análisis con Gemini
-│   └── 04_auditoria_contrato.py      # Cruce contable y emisión de dictamen contractual
-├── .env                              # Clave de API de Gemini y configuración de modelo
-├── requirements.txt                  # Dependencias de Python
-└── README.md                         # Documentación operativa
+│   ├── 00_orquestar_auditoria.py         # PUNTO DE ENTRADA ÚNICO (fases 1-4 por sub-lotes)
+│   ├── 01_pareto_universalidad.py        # Ranking Pareto canónico (# y Fila UNIVERSALIDAD)
+│   ├── 02_descargar_soportes_excel.py    # Descarga SharePoint / Graph / respaldo local
+│   ├── 03_extraccion_documental.py       # Visión -> hechos verificables + cruce determinístico
+│   ├── 04_clasificacion_auditoria.py     # 5 etiquetas + observación + hallazgos agrupados
+│   ├── auditoria/                        # Módulos compartidos
+│   │   ├── config.py                     #   taxonomía, partes relacionadas, RETEG, normalizadores
+│   │   ├── reconciliacion.py             #   cuadre de retenciones (módulo aparte y testeable)
+│   │   ├── lote_excel.py                 #   layout exacto del Excel de lote
+│   │   ├── modelos_llm.py                #   clientes Gemini / Claude con JSON estricto
+│   │   └── estado.py                     #   checkpoints y manifiesto
+│   └── legacy/                           # Versión anterior de la descarga (CSV Pareto), archivada
+├── tests/                                # python -m unittest discover -s tests
+├── .env                                  # Claves y credenciales (NO se versiona)
+└── requirements.txt
 ```
 
 ---
 
-## 2. Requisitos e Instalación
+## 2. Instalación y configuración
 
-### Requisitos previos
-- Python 3.10 o superior.
-- Clave de API de Google Gemini ([Google AI Studio](https://aistudio.google.com/)).
+Requisitos: Python 3.9 o superior (recomendado 3.11, como en CI).
 
-### Instalación de dependencias
 ```bash
 pip install -r requirements.txt
+cp .env.example .env      # y complete sus valores
 ```
 
-### Configuración del entorno (`.env`)
-Edite el archivo `.env` en la raíz del proyecto y configure sus credenciales:
-```env
-# Clave de Gemini
-GEMINI_API_KEY=AIzaSy...tu_clave_real_aqui
-GEMINI_MODEL=gemini-2.5-flash
+Variables principales del `.env` (ver [`.env.example`](.env.example)):
 
-# Opción A: Autenticación directa de SharePoint (si no tiene MFA obligatorio)
-SHAREPOINT_USER=tu_usuario@aerobaq.com
-SHAREPOINT_PASSWORD=tu_contraseña
-
-# Opción B: Si su cuenta tiene Doble Factor (MFA / Microsoft Authenticator):
-# En su navegador (Edge/Chrome), inicie sesión en https://aerobaq.sharepoint.com,
-# presione F12 -> pestaña "Aplicación" o "Almacenamiento" -> Cookies -> "aerobaq.sharepoint.com",
-# y copie el valor de la cookie 'FedAuth':
-SHAREPOINT_FEDAUTH=
-SHAREPOINT_RTFA=
-```
+| Variable | Uso |
+| :--- | :--- |
+| `MODELO_VISION` | `gemini` (defecto) o `claude`; se puede cambiar por corrida con `--modelo-vision`. |
+| `GEMINI_API_KEY`, `GEMINI_MODEL` | Cliente Gemini (defecto `gemini-2.5-flash`). |
+| `ANTHROPIC_API_KEY`, `CLAUDE_MODEL`, `CLAUDE_EFFORT` | Cliente Claude (defecto `claude-opus-5`, esfuerzo `high`). |
+| `CLAUDE_FALLBACKS` | `1` (defecto): si Claude rechaza una solicitud, el servidor la reintenta con un modelo de respaldo. `0` lo desactiva. |
+| `SHAREPOINT_USER` / `SHAREPOINT_PASSWORD` | Descarga autenticada (cuentas sin MFA). |
+| `SHAREPOINT_FEDAUTH` / `SHAREPOINT_RTFA` | Cookies de sesión si la cuenta tiene MFA (F12 → Cookies de aerobaq.sharepoint.com). |
+| `GRAPH_ACCESS_TOKEN` o `GRAPH_CLIENT_ID` (+`GRAPH_TENANT_ID`) | Respaldo por Microsoft Graph (`/v1.0/shares/{id}/driveItem`, scope `Files.Read.All`) para enlaces `:b:`. Con `GRAPH_CLIENT_ID` se usa el flujo de código de dispositivo (requiere `pip install msal`). |
 
 ---
 
-## 3. Guía de Ejecución Paso a Paso
+## 3. Uso: un solo comando por lote
 
-### Paso 1: Selección Muestral de Pareto (80/20)
-Lee la base matriz `data/raw/(A)BAS~1.xlsx` (hoja `UNIVERSALIDAD`), normaliza las columnas contables, convierte a valor absoluto, ordena de mayor a menor y extrae el 80% del valor total de la población (equivalente con exactitud al top 1.000 de transacciones).
 ```bash
-python src/01_pareto_universalidad.py
-```
-* **Salida generada**: `data/output/base_auditoria_pareto.csv`
-* **Estadísticas obtenidas**: 999 registros seleccionados que concentran **$624.515.778.070,19 COP** (80.00% de la masa total debitada/acreditada).
+# Ranks 4001-4500 del ranking Pareto, en sub-lotes de 20 filas, con Gemini
+python src/00_orquestar_auditoria.py --modo pareto --desde 4001 --hasta 4500 --tamano-lote 20
 
-### Paso 2: Descarga de Soportes Documentales (Datalake)
-Itera sobre los enlaces a los PDFs (`LINK_SOPORTE` / `URL`) de SharePoint, autentica la sesión contra Microsoft Online o inyecta las cookies de sesión y descarga los archivos con pausas e idempotencia.
-```bash
-python src/02_descargar_soportes.py
-```
-* **Opciones disponibles**:
-  * `--usuario usuario@aerobaq.com --password tu_clave`: Pasa credenciales por línea de comandos.
-  * `--fedauth <valor>`: Pasa la cookie de sesión de SharePoint directamente.
-  * `--limite 10`: Procesa únicamente un lote de prueba de 10 órdenes de pago.
-  * `--pausa 1.0`: Configura el tiempo de espera en segundos entre descargas.
-* **Salida generada**: Archivos PDF guardados en `data/datalake_pdfs/OP_{numero}.pdf`.
+# El mismo lote con Claude
+python src/00_orquestar_auditoria.py --modo pareto --desde 4001 --hasta 4500 --modelo-vision claude
 
-### Paso 3: Rasterizado y Extracción Multimodal con Gemini
-Convierte cada soporte PDF a imágenes JPEG a 150 DPI en memoria (vía `pdf2image` / `PIL` y backend `pymupdf`) y lo somete al modelo de visión de Gemini con un esquema estricto de JSON. Implementa reintentos automáticos con backoff exponencial ante errores 429 (límite de cuota) o 503 (servicio no disponible).
-```bash
-python src/03_extraccion_gemini.py
-```
-* **Opciones disponibles**:
-  * `--modelo gemini-2.5-flash`: Permite alternar entre modelos (`gemini-2.5-flash`, `gemini-1.5-flash`, etc.).
-  * `--limite 20`: Limita el número de PDFs a procesar en la corrida.
-* **Salida generada**: `data/output/resultados_gemini.csv`.
+# Reprocesar ranks pendientes de rondas anteriores (o elegidos a mano)
+python src/00_orquestar_auditoria.py --modo lista --ops "1677,3015" --nombre-lote Pendientes_ronda5
+python src/00_orquestar_auditoria.py --modo lista --archivo-ops ranks.csv
+python src/00_orquestar_auditoria.py --modo lista --ops "1956,8598" --tipo-id op   # por número de OP
 
-### Paso 4: Cruce y Dictamen de Auditoría Contractual
-Cruza las órdenes de pago contables con las extracciones documentales y aplica las reglas taxativas de reconocimiento del Numeral 22.3 c).
-```bash
-python src/04_auditoria_contrato.py
+# Continuar un lote existente (p. ej. uno que se trabajó a mano)
+python src/00_orquestar_auditoria.py --excel data/output/Validacion_Soportes_Rango4001-4500_UNIVERSALIDAD_ABAS1.xlsx
+
+# Reanudar el lote más reciente de data/output, sin argumentos
+python src/00_orquestar_auditoria.py
 ```
-* **Salida generada**: `data/output/reporte_auditoria_final.csv`.
+
+Opciones útiles:
+
+| Opción | Efecto |
+| :--- | :--- |
+| `--tamano-lote N` | Filas por sub-lote (10, 20, 100, 500…). Tras cada sub-lote se actualizan las hojas de hallazgos y control. |
+| `--limite N` | Máximo de filas pendientes a procesar en esta corrida (útil para pruebas). |
+| `--fases 1,2` | Ejecuta solo algunas fases (p. ej. crear el Excel y descargar sin llamar a ningún modelo). |
+| `--max-paginas 20` / `--dpi 150` | Páginas por expediente enviadas al modelo y resolución del rasterizado. |
+| `--respaldo RUTA` | Carpeta local sincronizada con OneDrive donde buscar el PDF si la red falla (repetible). |
+| `--fedauth …`, `--usuario …`, `--password …` | Credenciales de SharePoint por línea de comandos. |
+| `--reextraer` | Vuelve a llamar al modelo de visión aunque exista una extracción guardada. |
+
+**Reanudar es seguro.** Cada fila clasificada se escribe y se guarda en el Excel de inmediato
+(guardado atómico). Si se corta la conexión, se agota la cuota del modelo (el proceso se detiene
+limpiamente con código 2) o se cancela con Ctrl+C, basta repetir el mismo comando: las filas con
+"Resultado de validación" se omiten, los PDF ya descargados no se vuelven a pedir y las
+extracciones ya hechas no se vuelven a pagar. Si el Excel está abierto en Excel, el guardado
+reintenta y avisa.
+
+### Las 4 fases
+
+1. **Selección.** `--modo pareto`: ordena TODA la población de UNIVERSALIDAD por valor absoluto de
+   "VALOR DEBITADO O ACREDITADO" (orden estable), numera `#` solo entre las filas con NUMERO OP y
+   URL, y toma las posiciones N a M. `Fila UNIVERSALIDAD` es la posición en la población ordenada
+   + 1. (Verificado: reproduce exactamente los 804 ranks de los lotes 2301-2600 y 3501-4000.)
+   `--modo lista`: ranks u OP explícitos. Si el Excel del lote ya existe, solo se agregan las
+   filas que falten; nunca se regeneran las presentes.
+2. **Descarga.** Para cada fila sin resultado: si el PDF ya está en disco (>1 KB) o en la carpeta
+   de otro lote de `data/soportes/`, se reutiliza; si no, GET autenticado con reintentos y
+   backoff → Microsoft Graph (enlaces `:b:`; si el enlace es una carpeta, todos sus PDF quedan como
+   partes del mismo rank) → respaldo local. El manifiesto `_manifiesto_descarga.csv` registra
+   rank → archivo(s) → estado (`descargado_web`, `descargado_graph`, `recuperado_local`,
+   `ya_existia`, `fallido`). Si la URL del Excel viene como hipervínculo embebido y no como
+   texto, se lee del paquete OOXML (`workbook.xml` → rels → hoja → rels de la hoja).
+3. **Extracción documental.** Rasteriza el expediente (todas las partes del rank, en orden) a
+   150 DPI en memoria —los soportes son escaneos sin capa de texto; no se usa OCR local— y el
+   modelo de visión transcribe SOLO hechos verificables con un esquema JSON estricto: tercero/NIT
+   emisor y beneficiario del giro, número de documento, fecha, concepto, base, IVA, retenciones
+   impresas, neto, moneda y TRM impresa, menciones de NAB/GAC/OAC y su rol, endosos/cesiones,
+   menciones de servicio de deuda y calidad del escaneo, cada cifra con página y texto literal.
+   Luego Python (sin LLM) cruza contra UNIVERSALIDAD a nivel de fila y de OP (suma de sus filas),
+   cuadra retenciones, compara tercero, fecha y moneda y detecta RETEG y partes relacionadas.
+   Todo queda en `estado/<lote>/ranks/rNNNNN.json`.
+4. **Clasificación.** Con los datos de UNIVERSALIDAD (nunca la columna "Validación" ni un
+   resultado previo), los hechos y las señales determinísticas, el modelo emite etiqueta,
+   observación y tags; Python valida la etiqueta y aplica las reglas duras antes de escribir en
+   `Resultado de validación` y `Observación`.
 
 ---
 
-## 4. Lógica Contractual de Dictamen (Numeral 22.3 c)
+## 4. Metodología y taxonomía de clasificación
 
-El Numeral 22.3 c) del Contrato de Concesión establece una **lista taxativa** de costos y gastos reconocibles para la liquidación. El script aplica la siguiente matriz de decisiones en estricto orden de prelación:
+Por cada transacción se verifica: (1) valor del documento (bruto, IVA, retenciones) vs.
+"VALOR DEBITADO O ACREDITADO"; (2) tercero/beneficiario vs. TERCERO; (3) concepto vs. cuenta
+contable; (4) fecha del documento vs. fecha de pago; (5) encuadre en la lista **taxativa** de
+AR_i del numeral 22.3 c): (a) seguros/garantías del contrato, (b) aportes a subcuentas ANI,
+(c) comisión de éxito al Consultor estructurador, (d) estudios y diseños, (e) gestión
+social/ambiental, (f) gestión predial, (g) intervenciones verificadas por el Interventor,
+(h) operación/administración/impuestos, (i) comisiones a prestamistas distintas del servicio de
+deuda —el **servicio de la deuda** (capital o intereses) está excluido y se marca explícitamente—;
+(6) en USD, el valor en USD y si la TRM es confirmable en el propio soporte (nunca se inventa).
 
-| Condición Documental / Factura | Categoría | Dictamen Emitido | Fundamento Jurídico-Contractual |
-| :--- | :--- | :--- | :--- |
-| Servicio de deuda (amortización a capital o pago de intereses de crédito) | `EXCLUIDO` | **`NO RECONOCIBLE`** | Exclusión expresa legal del Numeral 22.3 c) (AR9 prohíbe el servicio de deuda). |
-| Emisor es parte vinculada (*NUEVO AEROPUERTO*, *GRUPO AEROPORTUARIO DEL CARIBE*, *OPERADORA AEROPORTUARIA*) | Cualquiera | **`POR VERIFICAR`** | Conflicto de interés y precios de transferencia. Exige aportar estudio y prueba de precios de mercado. |
-| Inversión en Intervenciones de Obra (`AR7`) o desembolso de anticipos contractuales | `AR7` / Anticipo | **`CONDICIONADO`** | Sujeto a la existencia y verificación del Acta de Obra suscrita por la Interventoría técnica. |
-| Pólizas y garantías contractuales | `AR1` | **`RECONOCIBLE`** | Primas y comisiones de pólizas de cumplimiento, RCE y todo riesgo autorizadas. |
-| Diseños y estudios de ingeniería | `AR4` | **`RECONOCIBLE`** | Estudios y diseños de intervenciones previstos contractualmente. |
-| Operación, Mantenimiento y Administración | `AR8` | **`RECONOCIBLE`** | Costos de OPEX, servicios generales, aseo, vigilancia e impuestos prediales/tasas. |
-| Sin soporte descargado / procesado en datalake | N/A | **`PENDIENTE DE SOPORTE`** | Registro contable que requiere gestión de descarga física o autenticación en SharePoint. |
+| Etiqueta | Cuándo |
+| :--- | :--- |
+| `COHERENTE` | Todo concilia sin reparos. |
+| `COHERENTE — VER NOTA` | Concilia razonablemente, pero hay algo que anotar: retención sin combinación estándar, OCR deficiente que aun así confirma lo esencial, patrón recurrente de proveedor, posible costo no imputable a parte relacionada, encuadre AR_i incierto, TRM no confirmable, cuadre solo a nivel de OP. |
+| `INCONCLUSO` | El documento no permite confirmar (ilegible, cifras irreconciliables). La observación dice qué haría falta para cerrarlo. |
+| `NO CORRESPONDE` | El pago no encaja en ninguna AR_i (servicio de deuda, traslado interno RETEG, donación u otro concepto ajeno), aunque esté bien soportado. |
+| `TERCERO NO COINCIDE` | El beneficiario real del soporte es distinto del tercero registrado en UNIVERSALIDAD. |
+
+### Reglas duras aplicadas en código
+- **No inventar cifras**: el modelo solo transcribe montos impresos; si el documento no deja leer
+  cifras y nada concilia, la fila no puede quedar COHERENTE.
+- **Sin PDF → celda en blanco**: la fila nunca se marca como revisada; se lista en
+  `pendientes_sin_resultado.csv` y en una entrada de "Hallazgos detallados".
+- **RETEG** (tercero BANCOLOMBIA SA con cuenta "AHO … PA ERNESTO CO"/"P A AEROPUERTO" o etiqueta
+  "RETEG OP n") → `NO CORRESPONDE` sin llamar al modelo.
+- **Partes relacionadas** (NAB 900.913.341, GAC 900.817.115, OAC 900.849.079): se señalan y
+  razonan, no se descartan. GAC como simple beneficiario de una garantía de anticipo de un
+  contratista externo es normal; como beneficiario final, parte contratante ("GAC-00X-YY") o
+  tomador+asegurado+beneficiario de su propia póliza → `COHERENTE — VER NOTA` (posible costo no
+  imputable al P.A.).
+- **Cuadre de retenciones** (`src/auditoria/reconciliacion.py`): si base+IVA no coincide con lo
+  registrado, se prueban retefuente (0-11 %), reteIVA (0/15/30/100 %) y reteICA (0-14 ‰) con
+  tolerancia de $1,50. Primero con tarifas estándar; si solo cierra con tarifas especiales se
+  reporta como *combinación atípica* (puede ser coincidencia) y la fila queda en VER NOTA. Si no
+  existe combinación: "diferencia sin explicar". Las tarifas son parámetros editables y
+  `tests/test_reconciliacion.py` contiene casos reales para ajustarlas.
+- **Independencia del auditor**: ni "Resultado de validación", ni "Observación", ni la columna
+  "Validación" de UNIVERSALIDAD se envían al modelo.
+- Un `COHERENTE` con diferencia sin explicar, TRM no confirmable o tercero ausente del soporte
+  baja automáticamente a `COHERENTE — VER NOTA` (la observación lo indica con
+  "[Ajuste automático: …]").
 
 ---
 
-## 5. Cuadre Automático de Cifras
-El reporte final computa la diferencia:
-$$\text{DIFERENCIA\_VALOR} = \text{VALOR\_ABSOLUTO (Contabilidad)} - \text{VALOR\_TOTAL\_EXTRAIDO (Factura)}$$
-Permitiendo a los auditores identificar inmediatamente glosas, retenciones tributarias no conciliadas o desviaciones entre el giro bancario del fideicomiso y la factura comercial.
+## 5. Entregable: el Excel del lote
+
+Mismo layout que el entregable manual (nunca se cambia):
+
+- **Resumen**: filas 1-5 de título y notas (descripción, cobertura acumulada); encabezado en la
+  fila 6 desde la columna B: `#`, `Fila UNIVERSALIDAD`, `OP`, `Tercero (según UNIVERSALIDAD)`,
+  `Cuenta contable`, `Fecha`, `Valor (COP)`, `Moneda carpeta`, `URL soporte`,
+  `Resultado de validación`, `Observación`. El código solo escribe en las dos últimas.
+- **Hallazgos detallados**: entradas agrupadas por patrón (no por rank) marcadas `[Automático]`,
+  que se actualizan en su lugar en cada sub-lote: servicio de deuda, RETEG, TERCERO NO COINCIDE,
+  NO CORRESPONDE, partes relacionadas / posibles costos no imputables, USD sin TRM, endosos y
+  factoring, encuadre AR_i incierto, inconsistencias UNIVERSALIDAD vs. documento, diferencias
+  sin explicar, OCR deficiente, INCONCLUSO (con qué falta), proveedores recurrentes y pendientes
+  sin PDF. Las entradas escritas a mano no se tocan.
+- **Control de calidad**: sección automática al final (se reescribe en cada sub-lote) con
+  anomalías de los datos de UNIVERSALIDAD: OP presentes en más de un rank del lote, colisiones de
+  numeración, ranks del Excel discordantes con el ranking recalculado, base/IVA que no
+  corresponden al documento, IVA atípico. Se documentan, no se corrigen.
+
+### Scripts por fase (uso avanzado)
+Cada fase se puede correr sola sobre un lote existente:
+```bash
+python src/01_pareto_universalidad.py                       # exporta data/output/base_auditoria_pareto.csv
+python src/02_descargar_soportes_excel.py --excel <lote.xlsx> [--lote 10] [--fedauth …]
+python src/03_extraccion_documental.py --excel <lote.xlsx> [--modelo-vision claude] [--limite 5]
+python src/04_clasificacion_auditoria.py --excel <lote.xlsx> [--limite 5]
+```
+
+### Pruebas
+```bash
+python -m unittest discover -s tests
+```
+Incluyen los casos reales de cuadre de la ronda 3501-4000, el layout del Excel, las reglas duras
+y una corrida de punta a punta del orquestador con un modelo simulado (requiere PyMuPDF).
 
 ---
 
@@ -134,7 +228,7 @@ El proyecto cuenta con configuración para versionado seguro y pipeline de Integ
 El archivo `.gitignore` garantiza que **NUNCA** se suban a GitHub:
 - Secretos o credenciales (`.env`).
 - Archivos Excel contables del fideicomiso (`*.xlsx`, `*.xlsm`).
-- Soportes documentales en PDF (`data/datalake_pdfs/`, `*.pdf`).
+- Soportes documentales en PDF (`data/soportes/`, `*.pdf`) y checkpoints de `data/output/`.
 - Informes institucionales (`*.docx`, `*.pptx`).
 
 Se incluye la plantilla pública segura [`.env.example`](.env.example) para documentar las variables requeridas.
@@ -157,7 +251,8 @@ Se incluye la plantilla pública segura [`.env.example`](.env.example) para docu
 
 ### Integración Continua (GitHub Actions)
 El flujo en [`.github/workflows/ci.yml`](.github/workflows/ci.yml) se ejecuta automáticamente ante cada `push` o `pull_request`:
-- Verifica la compilación y sintaxis de todos los scripts en `src/`.
+- Verifica la compilación y sintaxis de todos los scripts en `src/` y `src/auditoria/`.
+- Ejecuta las pruebas de `tests/` (reconciliación, layout del Excel, reglas duras, orquestador).
 - Comprueba que `.env` no haya sido versionado por error.
 - Valida la integridad estructural de directorios.
 

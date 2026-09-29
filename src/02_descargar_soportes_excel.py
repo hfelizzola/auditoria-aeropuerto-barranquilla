@@ -1,56 +1,62 @@
 """
-02_descargar_soportes.py
-========================
-Módulo para la descarga secuencial y autenticada de los soportes documentales
-(archivos PDF) a partir de un archivo Excel de VALIDACIÓN POR LOTE (los archivos
-"Validacion_Soportes_RangoXXXX-YYYY_UNIVERSALIDAD_ABAS1.xlsx" generados para cada
-tramo del ranking, hoja "Resumen").
+02_descargar_soportes_excel.py
+==============================
+Descarga secuencial y autenticada de los soportes documentales (PDF) de un lote de
+validación: el Excel "Validacion_Soportes_RangoXXXX-YYYY_UNIVERSALIDAD_ABAS1.xlsx"
+(hoja "Resumen"), respetando su columna "#" (rank) y "OP", y usando "URL soporte"
+como enlace de descarga.
 
-A diferencia de la versión anterior (que leía el CSV completo `base_auditoria_pareto.csv`
-en orden Pareto), esta versión descarga EXACTAMENTE el lote que está definido en el
-Excel de validación que le indiques con --excel, respetando su columna "#" (rank) y
-"OP", y usando la columna "URL soporte" como enlace de descarga.
+Se usa de dos formas:
+- como script CLI independiente (--excel ...), o
+- como módulo desde el orquestador (00_orquestar_auditoria.py), vía `descargar_filas()`.
 
-Soporte de Autenticación para SharePoint Online (aerobaq.sharepoint.com):
-1. Autenticación directa por Usuario y Contraseña (vía protocolo WS-Trust SAML 1.1 de Microsoft Online).
-2. Autenticación mediante Cookies de Sesión ('FedAuth' y 'rtFa') para cuentas corporativas con
-   Doble Factor de Autenticación (MFA / 2FA / Microsoft Authenticator).
-3. Autenticación básica HTTP (Basic Auth) para repositorios web protegidos estándar.
-4. Respaldo local inteligente si el archivo ya fue descargado o sincronizado previamente
-   (por ejemplo, si ya sincronizaste la biblioteca de SharePoint con OneDrive: apunta
-   --respaldo a esa carpeta local y el script copia de ahí en vez de pedir red).
+Orden de intentos por fila (idempotente):
+1. Si el PDF ya existe en disco (> 1 KB) en la carpeta del lote o en otra carpeta de
+   data/soportes/ (lotes anteriores), no se vuelve a descargar.
+2. GET autenticado a SharePoint (cookie FedAuth/rtFa o usuario/contraseña vía SAML),
+   con reintentos y backoff exponencial ante fallas de red / 429 / 5xx.
+3. Microsoft Graph API (`/v1.0/shares/{share_id}/driveItem`, scope Files.Read.All) cuando
+   el GET directo no devuelve un PDF — típico de los enlaces de compartición `:b:`.
+   Si el enlace apunta a una carpeta, se descargan todos sus PDF como partes del mismo rank.
+   Token: GRAPH_ACCESS_TOKEN en .env, o flujo de código de dispositivo con MSAL si hay
+   GRAPH_CLIENT_ID (y opcionalmente GRAPH_TENANT_ID).
+4. Respaldo local por nombre de archivo (biblioteca de SharePoint sincronizada con OneDrive).
+5. Si nada funciona: estado "fallido" (el rank queda SIN resultado y se lista como pendiente).
+
+Autenticación SharePoint Online (aerobaq.sharepoint.com):
+1. Usuario y contraseña (WS-Trust SAML 1.1 de Microsoft Online).
+2. Cookies de sesión 'FedAuth' y 'rtFa' para cuentas con MFA.
 
 Uso típico:
-    python 02_descargar_soportes.py --excel "Validacion_Soportes_Rango2301-2600_UNIVERSALIDAD_ABAS1.xlsx"
-
-    # Solo probar con los primeros 10 pendientes del lote:
-    python 02_descargar_soportes.py --excel "...xlsx" --lote 10
-
-    # Reintentar TODO el lote aunque ya tenga "Resultado de validación" (por defecto se saltan):
-    python 02_descargar_soportes.py --excel "...xlsx" --incluir-validadas
-
-    # Usando cookie FedAuth (cuentas con MFA):
-    python 02_descargar_soportes.py --excel "...xlsx" --fedauth "AAMkAGI2...."
-
-    # Usando una carpeta ya sincronizada con OneDrive como respaldo primero (evita red):
-    python 02_descargar_soportes.py --excel "...xlsx" --respaldo "C:\\Users\\tú\\OneDrive - ANI\\FTAPA"
+    python src/02_descargar_soportes_excel.py --excel "Validacion_Soportes_Rango2301-2600_UNIVERSALIDAD_ABAS1.xlsx"
+    python src/02_descargar_soportes_excel.py --excel "...xlsx" --lote 10
+    python src/02_descargar_soportes_excel.py --excel "...xlsx" --fedauth "AAMkAGI2...."
+    python src/02_descargar_soportes_excel.py --excel "...xlsx" --respaldo "C:\\Users\\tú\\OneDrive - ANI\\FTAPA"
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import glob
 import logging
 import os
 import re
+import shutil
 import sys
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
-import openpyxl
 import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from auditoria.config import DIR_CACHE, DIR_SOPORTES, cargar_env  # noqa: E402
+from auditoria.estado import actualizar_manifiesto, ahora  # noqa: E402
+from auditoria.lote_excel import LoteExcel  # noqa: E402
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,19 +65,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Cargar variables de entorno desde .env con fallback nativo
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    env_file = Path(__file__).resolve().parent.parent / ".env"
-    if env_file.exists():
-        with open(env_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, v = line.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip())
+cargar_env()
 
 HEADERS_HTTP = {
     "User-Agent": (
@@ -82,25 +76,8 @@ HEADERS_HTTP = {
     "Accept": "application/pdf,*/*",
 }
 
-# Encabezados esperados en la hoja "Resumen" de los archivos de validación por lote.
-# Se busca esta fila automáticamente porque cada lote trae un número distinto de
-# líneas de nota/aviso antes de la tabla.
-COLUMNAS_ESPERADAS = {
-    "rank": "#",
-    "fila": "Fila UNIVERSALIDAD",
-    "op": "OP",
-    "tercero": "Tercero (según UNIVERSALIDAD)",
-    "cuenta": "Cuenta contable",
-    "fecha": "Fecha",
-    "valor": "Valor (COP)",
-    "moneda": "Moneda carpeta",
-    "url": "URL soporte",
-    "resultado": "Resultado de validación",
-    "observacion": "Observación",
-}
 
-
-def sanitizar_nombre(valor: any, largo_max: int = 40) -> str:
+def sanitizar_nombre(valor: Any, largo_max: int = 40) -> str:
     """Limpia un texto para usarlo como parte de un nombre de archivo."""
     if valor is None:
         return ""
@@ -110,7 +87,7 @@ def sanitizar_nombre(valor: any, largo_max: int = 40) -> str:
     return txt[:largo_max].rstrip("_")
 
 
-def sanitizar_op(op_valor: any) -> Optional[str]:
+def sanitizar_op(op_valor: Any) -> Optional[str]:
     """Limpia el número de OP para usarlo como nombre de archivo."""
     if op_valor is None:
         return None
@@ -273,81 +250,331 @@ def crear_sesion_autenticada(
     return session
 
 
-def buscar_respaldo_local(nombre_archivo: str, directorios_base: list[Path]) -> Optional[Path]:
-    """Busca si el archivo PDF ya existe en directorios locales de respaldo
-    (por ejemplo, una biblioteca de SharePoint ya sincronizada con OneDrive)."""
-    for base in directorios_base:
-        if not base.exists():
-            continue
-        candidatos = list(base.rglob(nombre_archivo))
-        if candidatos:
-            return candidatos[0]
-    return None
+# ---------------------------------------------------------------------------
+# Nombres de archivo, respaldo local y existentes
+# ---------------------------------------------------------------------------
+
+TAMANO_MINIMO_PDF = 1024
 
 
-def _encontrar_fila_encabezado(ws) -> Optional[int]:
-    """Ubica la fila de encabezado en la hoja 'Resumen' buscando la fila que
-    contiene '#' y 'URL soporte' entre sus celdas. Necesario porque cada lote
-    trae un número distinto de líneas de nota/aviso antes de la tabla."""
-    for r in range(1, min(ws.max_row, 30) + 1):
-        valores = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
-        if COLUMNAS_ESPERADAS["rank"] in valores and COLUMNAS_ESPERADAS["url"] in valores:
-            return r
-    return None
+def nombre_archivo_soporte(rank: Any, op: Any, tercero: Any, parte: int = 1) -> str:
+    """'03505_OP11745_B&S_INGENIERIA_SAS.pdf' (parte 2+ -> '..._parte2.pdf')."""
+    op_id = sanitizar_op(op) or "SINOP"
+    rank_i = int(float(rank)) if rank is not None else 0
+    base = f"{rank_i:05d}_OP{op_id}_{sanitizar_nombre(tercero)}".replace("__", "_").rstrip("_")
+    return f"{base}.pdf" if parte == 1 else f"{base}_parte{parte}.pdf"
 
 
-def leer_lote_excel(ruta_excel: Path, hoja: str = "Resumen") -> list[dict]:
-    """Lee el Excel de validación por lote y devuelve una lista de diccionarios,
-    uno por fila de transacción a descargar."""
-    wb = openpyxl.load_workbook(ruta_excel, data_only=True)
-    if hoja not in wb.sheetnames:
-        raise ValueError(f"La hoja '{hoja}' no existe en '{ruta_excel.name}'. Hojas disponibles: {wb.sheetnames}")
-    ws = wb[hoja]
+def pdfs_de_rank(directorio: Path, rank: Any, op: Any) -> List[Path]:
+    """PDFs válidos (> 1 KB) ya presentes para un rank/OP, ordenados (parte 1, 2, ...)."""
+    op_id = sanitizar_op(op) or "SINOP"
+    patron = glob.escape(f"{int(float(rank)):05d}_OP{op_id}_") + "*.pdf"
+    return sorted((p for p in Path(directorio).glob(patron) if p.stat().st_size > TAMANO_MINIMO_PDF),
+                  key=lambda p: (len(p.name), p.name))
 
-    fila_hdr = _encontrar_fila_encabezado(ws)
-    if fila_hdr is None:
-        raise ValueError(
-            f"No se encontró la fila de encabezado (columnas '#' y 'URL soporte') en "
-            f"'{ruta_excel.name}' / hoja '{hoja}'. Verifique que sea un archivo de validación por lote."
-        )
 
-    # Mapear nombre de columna -> índice de columna en esa fila de encabezado
-    col_idx = {}
-    for c in range(1, ws.max_column + 1):
-        val = ws.cell(row=fila_hdr, column=c).value
-        for clave, etiqueta in COLUMNAS_ESPERADAS.items():
-            if val == etiqueta:
-                col_idx[clave] = c
+def es_pdf_valido(ruta: Path) -> bool:
+    try:
+        with open(ruta, "rb") as fh:
+            return ruta.stat().st_size > TAMANO_MINIMO_PDF and fh.read(5).startswith(b"%PDF")
+    except OSError:
+        return False
 
-    faltantes = set(["rank", "op", "url"]) - set(col_idx.keys())
-    if faltantes:
-        raise ValueError(f"Faltan columnas obligatorias en el encabezado: {faltantes}")
 
-    filas = []
-    for r in range(fila_hdr + 1, ws.max_row + 1):
-        op_val = ws.cell(row=r, column=col_idx["op"]).value
-        url_val = ws.cell(row=r, column=col_idx.get("url")).value
-        if op_val is None or url_val is None:
-            continue  # fila vacía (p.ej. separador entre secciones)
-        url_val = str(url_val).strip()
-        if not url_val.startswith(("http://", "https://")):
-            continue
+class IndiceRespaldo:
+    """Índice nombre_de_archivo -> ruta de las carpetas de respaldo (se construye una sola vez)."""
 
-        fila_dict = {
-            "rank": ws.cell(row=r, column=col_idx["rank"]).value,
-            "fila_universalidad": ws.cell(row=r, column=col_idx.get("fila")).value if "fila" in col_idx else None,
-            "op": op_val,
-            "tercero": ws.cell(row=r, column=col_idx.get("tercero")).value if "tercero" in col_idx else None,
-            "cuenta": ws.cell(row=r, column=col_idx.get("cuenta")).value if "cuenta" in col_idx else None,
-            "fecha": ws.cell(row=r, column=col_idx.get("fecha")).value if "fecha" in col_idx else None,
-            "valor": ws.cell(row=r, column=col_idx.get("valor")).value if "valor" in col_idx else None,
-            "moneda": ws.cell(row=r, column=col_idx.get("moneda")).value if "moneda" in col_idx else None,
-            "url": url_val,
-            "resultado": ws.cell(row=r, column=col_idx.get("resultado")).value if "resultado" in col_idx else None,
-        }
-        filas.append(fila_dict)
+    def __init__(self, directorios: List[Path]):
+        self.directorios = [Path(d) for d in directorios if d and Path(d).exists()]
+        self._indice: Optional[Dict[str, Path]] = None
 
-    return filas
+    def buscar(self, nombre_archivo: str) -> Optional[Path]:
+        if not self.directorios or not nombre_archivo:
+            return None
+        if self._indice is None:
+            logger.info(f"Indexando carpetas de respaldo local: {[str(d) for d in self.directorios]}...")
+            self._indice = {}
+            for base in self.directorios:
+                for raiz, _, archivos in os.walk(base):
+                    for a in archivos:
+                        if a.lower().endswith(".pdf"):
+                            self._indice.setdefault(a.lower(), Path(raiz) / a)
+            logger.info(f"Respaldo local indexado: {len(self._indice):,} PDF.")
+        return self._indice.get(nombre_archivo.lower())
+
+
+def buscar_respaldo_local(nombre_archivo: str, directorios_base: List[Path]) -> Optional[Path]:
+    """Compatibilidad: búsqueda puntual en carpetas de respaldo."""
+    return IndiceRespaldo(directorios_base).buscar(nombre_archivo)
+
+
+# ---------------------------------------------------------------------------
+# Microsoft Graph (respaldo para enlaces de compartición ':b:')
+# ---------------------------------------------------------------------------
+
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPE = "https://graph.microsoft.com/Files.Read.All"
+
+
+def codificar_share_id(url: str) -> str:
+    """Codificación de URL de compartición para /shares/{id}: 'u!' + base64url sin relleno."""
+    b64 = base64.b64encode(url.encode("utf-8")).decode("ascii")
+    return "u!" + b64.rstrip("=").replace("/", "_").replace("+", "-")
+
+
+class ClienteGraph:
+    """Descarga vía Graph API. Token de GRAPH_ACCESS_TOKEN o MSAL (device code)."""
+
+    def __init__(self, token: Optional[str] = None):
+        self._token = token or os.getenv("GRAPH_ACCESS_TOKEN", "").strip() or None
+        self._client_id = os.getenv("GRAPH_CLIENT_ID", "").strip()
+        self._tenant = os.getenv("GRAPH_TENANT_ID", "").strip() or "organizations"
+        self._msal_fallo = False
+
+    @property
+    def disponible(self) -> bool:
+        return bool(self._token or (self._client_id and not self._msal_fallo))
+
+    def _obtener_token(self) -> Optional[str]:
+        if self._token:
+            return self._token
+        if not self._client_id or self._msal_fallo:
+            return None
+        try:
+            import msal
+        except ImportError:
+            logger.warning("GRAPH_CLIENT_ID configurado pero falta 'msal' (pip install msal).")
+            self._msal_fallo = True
+            return None
+        ruta_cache = DIR_CACHE / "msal_token_cache.bin"
+        cache = msal.SerializableTokenCache()
+        if ruta_cache.exists():
+            cache.deserialize(ruta_cache.read_text(encoding="utf-8"))
+        app = msal.PublicClientApplication(self._client_id, token_cache=cache,
+                                           authority=f"https://login.microsoftonline.com/{self._tenant}")
+        cuentas = app.get_accounts()
+        resultado = app.acquire_token_silent([GRAPH_SCOPE], account=cuentas[0]) if cuentas else None
+        if not resultado:
+            flujo = app.initiate_device_flow(scopes=[GRAPH_SCOPE])
+            if "user_code" not in flujo:
+                logger.error(f"No se pudo iniciar el flujo de dispositivo de Graph: {flujo}")
+                self._msal_fallo = True
+                return None
+            logger.warning(f"[GRAPH] {flujo['message']}")
+            resultado = app.acquire_token_by_device_flow(flujo)
+        if "access_token" not in resultado:
+            logger.error(f"[GRAPH] No se obtuvo token: {resultado.get('error_description')}")
+            self._msal_fallo = True
+            return None
+        if cache.has_state_changed:
+            DIR_CACHE.mkdir(parents=True, exist_ok=True)
+            ruta_cache.write_text(cache.serialize(), encoding="utf-8")
+        self._token = resultado["access_token"]
+        return self._token
+
+    def _get(self, url: str, **kw) -> requests.Response:
+        token = self._obtener_token()
+        if not token:
+            raise RuntimeError("Sin token de Graph")
+        headers = {"Authorization": f"Bearer {token}", "Prefer": "redeemSharingLinkIfNecessary"}
+        return requests.get(url, headers=headers, timeout=60, **kw)
+
+    def descargar(self, url_compartida: str, destinos: List[Path]) -> List[Path]:
+        """Descarga el archivo (o los PDF de la carpeta) apuntado por el enlace.
+
+        `destinos` es la lista de rutas a usar en orden (parte 1, 2, ...)."""
+        share_id = codificar_share_id(url_compartida)
+        r = self._get(f"{GRAPH_BASE}/shares/{share_id}/driveItem")
+        if r.status_code != 200:
+            raise RuntimeError(f"Graph driveItem HTTP {r.status_code}: {r.text[:200]}")
+        item = r.json()
+        if "folder" in item:
+            hijos, siguiente = [], f"{GRAPH_BASE}/shares/{share_id}/driveItem/children"
+            while siguiente:
+                rr = self._get(siguiente)
+                rr.raise_for_status()
+                datos = rr.json()
+                hijos += [h for h in datos.get("value", []) if h.get("name", "").lower().endswith(".pdf")]
+                siguiente = datos.get("@odata.nextLink")
+            items = sorted(hijos, key=lambda h: h.get("name", ""))
+        else:
+            items = [item]
+        guardados = []
+        for item_pdf, destino in zip(items, destinos):
+            url_descarga = item_pdf.get("@microsoft.graph.downloadUrl")
+            resp = requests.get(url_descarga, timeout=120) if url_descarga else None
+            if resp is None or resp.status_code != 200 or not resp.content.startswith(b"%PDF"):
+                raise RuntimeError(f"Graph no entregó un PDF para '{item_pdf.get('name')}'")
+            destino.write_bytes(resp.content)
+            guardados.append(destino)
+        if len(items) > len(destinos):
+            logger.warning(f"La carpeta compartida tiene {len(items)} PDF; se descargaron {len(destinos)}.")
+        return guardados
+
+
+# ---------------------------------------------------------------------------
+# Descarga de una fila y de un conjunto de filas
+# ---------------------------------------------------------------------------
+
+def _get_con_reintentos(session: requests.Session, url: str, reintentos: int, espera_base: float) -> Optional[requests.Response]:
+    """GET con backoff exponencial ante fallas de red, 429 y 5xx. Devuelve la última respuesta."""
+    resp = None
+    for intento in range(1, reintentos + 1):
+        try:
+            resp = session.get(url, timeout=60, allow_redirects=True)
+            if resp.status_code not in (429, 500, 502, 503, 504):
+                return resp
+            motivo = f"HTTP {resp.status_code}"
+        except requests.exceptions.RequestException as e:
+            motivo = f"{type(e).__name__}: {e}"
+        if intento < reintentos:
+            espera = espera_base * (2 ** (intento - 1))
+            if resp is not None and resp.headers.get("Retry-After", "").isdigit():
+                espera = max(espera, float(resp.headers["Retry-After"]))
+            logger.warning(f"   reintento {intento}/{reintentos - 1} en {espera:.0f}s ({motivo})")
+            time.sleep(espera)
+    return resp
+
+
+class Descargador:
+    """Estado compartido de una corrida de descargas (sesión, Graph, índice de respaldo)."""
+
+    def __init__(self, directorio_destino: Path, usuario=None, contrasena=None, fedauth=None, rtfa=None,
+                 respaldo_extra: Optional[List[Path]] = None, reintentos: int = 3, espera_base: float = 2.0,
+                 buscar_en_otros_lotes: bool = True):
+        self.directorio = Path(directorio_destino)
+        self.directorio.mkdir(parents=True, exist_ok=True)
+        self._cred = dict(usuario=usuario, contrasena=contrasena, fedauth_cookie=fedauth, rtfa_cookie=rtfa)
+        self._session: Optional[requests.Session] = None
+        self.graph = ClienteGraph()
+        base = Path(__file__).resolve().parent.parent
+        self.respaldo = IndiceRespaldo(list(respaldo_extra or []) + [
+            base.parent / "CUARTO DE DATOS GAC", base.parent / "Auditoria", base / "Soportes"])
+        self.reintentos = reintentos
+        self.espera_base = espera_base
+        self.buscar_en_otros_lotes = buscar_en_otros_lotes
+
+    def _sesion(self, url: str) -> requests.Session:
+        if self._session is None:
+            p = urlparse(url)
+            self._session = crear_sesion_autenticada(dominio_sitio=f"{p.scheme}://{p.netloc}", **self._cred)
+        return self._session
+
+    def _en_otros_lotes(self, rank, op) -> List[Path]:
+        if not self.buscar_en_otros_lotes or not DIR_SOPORTES.exists():
+            return []
+        for carpeta in DIR_SOPORTES.iterdir():
+            if carpeta.is_dir() and carpeta.resolve() != self.directorio.resolve():
+                encontrados = pdfs_de_rank(carpeta, rank, op)
+                if encontrados:
+                    return encontrados
+        return []
+
+    def descargar_fila(self, fila: Dict[str, Any]) -> Dict[str, Any]:
+        """Descarga el soporte de una fila del lote. Devuelve {estado, archivos, detalle}."""
+        rank, op, url = fila["rank"], fila["op"], fila.get("url")
+        existentes = pdfs_de_rank(self.directorio, rank, op)
+        if existentes:
+            return {"estado": "ya_existia", "archivos": existentes, "detalle": ""}
+
+        de_otro_lote = self._en_otros_lotes(rank, op)
+        if de_otro_lote:
+            copias = []
+            for p in de_otro_lote:
+                destino = self.directorio / p.name
+                shutil.copy2(p, destino)
+                copias.append(destino)
+            return {"estado": "recuperado_local", "archivos": copias,
+                    "detalle": f"copiado de data/soportes/{de_otro_lote[0].parent.name}"}
+
+        if not url or not str(url).lower().startswith(("http://", "https://")):
+            return {"estado": "fallido", "archivos": [], "detalle": "sin URL de soporte"}
+
+        destinos = [self.directorio / nombre_archivo_soporte(rank, op, fila.get("tercero"), parte=i)
+                    for i in range(1, 21)]
+        detalles = []
+
+        # 1) GET directo autenticado, con reintentos
+        resp = _get_con_reintentos(self._sesion(url), url, self.reintentos, self.espera_base)
+        if resp is not None and resp.status_code == 200 and resp.content.startswith(b"%PDF"):
+            destinos[0].write_bytes(resp.content)
+            return {"estado": "descargado_web", "archivos": [destinos[0]], "detalle": f"{len(resp.content):,} bytes"}
+        if resp is None:
+            detalles.append("GET sin respuesta")
+        elif resp.status_code == 200:
+            detalles.append(f"GET 200 pero no es PDF ({resp.headers.get('Content-Type')}): requiere sesión activa")
+        else:
+            detalles.append(f"GET HTTP {resp.status_code}")
+
+        # 2) Graph API (enlaces ':b:' o GET directo que no entrega el PDF)
+        if self.graph.disponible:
+            for intento in range(1, self.reintentos + 1):
+                try:
+                    guardados = self.graph.descargar(url, destinos)
+                    if guardados:
+                        return {"estado": "descargado_graph", "archivos": guardados,
+                                "detalle": "; ".join(detalles + [f"Graph OK ({len(guardados)} archivo(s))"])}
+                    detalles.append("Graph: sin PDF")
+                    break
+                except Exception as e:  # noqa: BLE001
+                    if intento == self.reintentos:
+                        detalles.append(f"Graph: {e}")
+                    else:
+                        time.sleep(self.espera_base * (2 ** (intento - 1)))
+        elif "/:b:/" in url:
+            detalles.append("enlace ':b:' y Graph no configurado (GRAPH_ACCESS_TOKEN o GRAPH_CLIENT_ID)")
+
+        # 3) Respaldo local (biblioteca sincronizada con OneDrive)
+        archivo_local = self.respaldo.buscar(Path(unquote(urlparse(url).path)).name)
+        if archivo_local is not None:
+            shutil.copy2(archivo_local, destinos[0])
+            return {"estado": "recuperado_local", "archivos": [destinos[0]],
+                    "detalle": "; ".join(detalles + [f"copiado de '{archivo_local}'"])}
+
+        return {"estado": "fallido", "archivos": [], "detalle": "; ".join(detalles)}
+
+
+def descargar_filas(filas: List[Dict[str, Any]], directorio_destino: Path, pausa_segundos: float = 1.0,
+                    descargador: Optional[Descargador] = None, **kwargs_descargador) -> Dict[Any, Dict[str, Any]]:
+    """Descarga una lista de filas del lote y actualiza el manifiesto. {rank: resultado}."""
+    descargador = descargador or Descargador(directorio_destino, **kwargs_descargador)
+    ruta_manifiesto = Path(directorio_destino) / "_manifiesto_descarga.csv"
+    resultados: Dict[Any, Dict[str, Any]] = {}
+    for pos, fila in enumerate(filas, 1):
+        monto = fila.get("valor")
+        monto_str = f" ${abs(monto):,.0f}" if isinstance(monto, (int, float)) else ""
+        res = descargador.descargar_fila(fila)
+        resultados[fila["rank"]] = res
+        nivel = logging.WARNING if res["estado"] == "fallido" else logging.INFO
+        logger.log(nivel, f"[{pos}/{len(filas)}] rank #{fila['rank']} OP {fila['op']}{monto_str}: "
+                          f"{res['estado']}" + (f" — {res['detalle']}" if res["detalle"] else ""))
+        actualizar_manifiesto(ruta_manifiesto, [{
+            "rank": fila["rank"], "fila_universalidad": fila.get("fila_universalidad"), "op": fila.get("op"),
+            "tercero": fila.get("tercero"), "fecha": fila.get("fecha"), "valor": fila.get("valor"),
+            "moneda": fila.get("moneda"), "url": fila.get("url"),
+            "archivo_local": ";".join(p.name for p in res["archivos"]), "estado": res["estado"],
+            "detalle": res["detalle"], "actualizado": ahora(),
+        }])
+        if res["estado"] in ("descargado_web", "descargado_graph") and pos < len(filas):
+            time.sleep(pausa_segundos)
+    return resultados
+
+
+# ---------------------------------------------------------------------------
+# Lectura del lote y CLI independiente
+# ---------------------------------------------------------------------------
+
+def leer_lote_excel(ruta_excel: Path, hoja: str = "Resumen") -> List[Dict[str, Any]]:
+    """Filas del Excel de lote con URL (texto plano o hipervínculo embebido)."""
+    if hoja != "Resumen":
+        raise ValueError("Solo se soporta la hoja 'Resumen' del layout de lote.")
+    return [
+        {"rank": f.rank, "fila_universalidad": f.fila_universalidad, "op": f.op, "tercero": f.tercero,
+         "cuenta": f.cuenta, "fecha": f.fecha, "valor": f.valor, "moneda": f.moneda, "url": f.url,
+         "resultado": f.resultado, "fila_excel": f.fila_excel}
+        for f in LoteExcel.abrir(Path(ruta_excel)).filas()
+        if f.op is not None and f.rank is not None and f.url
+    ]
 
 
 def descargar_soportes_desde_excel(
@@ -361,181 +588,38 @@ def descargar_soportes_desde_excel(
     contrasena: Optional[str] = None,
     fedauth: Optional[str] = None,
     rtfa: Optional[str] = None,
-    respaldo_extra: Optional[list[Path]] = None,
+    respaldo_extra: Optional[List[Path]] = None,
 ) -> dict:
-    """
-    Descarga los PDFs listados en un Excel de validación por lote (hoja 'Resumen').
+    """Descarga los PDFs listados en un Excel de validación por lote (hoja 'Resumen').
 
-    Por defecto, omite las filas que ya tengan algo escrito en 'Resultado de
-    validación' (para no repetir descargas de un lote parcialmente trabajado);
-    use incluir_validadas=True para forzar la descarga de todo el lote de todas
-    formas.
+    Por defecto omite las filas que ya tienen 'Resultado de validación'.
     """
     ruta_excel = Path(ruta_excel)
     if not ruta_excel.exists():
         raise FileNotFoundError(f"No se encontró el archivo Excel '{ruta_excel}'.")
+    directorio_destino = Path(directorio_destino or DIR_SOPORTES / ruta_excel.stem)
 
-    if directorio_destino is None:
-        directorio_destino = Path.cwd() / "data" / "soportes" / ruta_excel.stem
-    directorio_destino.mkdir(parents=True, exist_ok=True)
-
-    rutas_respaldo = list(respaldo_extra or [])
-    # Rutas de respaldo típicas del proyecto (se ignoran silenciosamente si no existen)
-    rutas_respaldo += [
-        Path.cwd().parent / "CUARTO DE DATOS GAC",
-        Path.cwd().parent / "Auditoria",
-        Path.cwd() / "Soportes",
-    ]
-
-    logger.info(f"Leyendo lote de validación desde '{ruta_excel.name}' (hoja '{hoja}')...")
     filas = leer_lote_excel(ruta_excel, hoja=hoja)
-    logger.info(f"Total de filas con URL válida en el lote: {len(filas):,}")
-
+    logger.info(f"Total de filas con URL en el lote '{ruta_excel.name}': {len(filas):,}")
     if not incluir_validadas:
-        antes = len(filas)
         filas = [f for f in filas if not (f["resultado"] and str(f["resultado"]).strip())]
-        omitidas = antes - len(filas)
-        if omitidas:
-            logger.info(
-                f"[OMITIDAS] {omitidas:,} filas ya tienen 'Resultado de validación' y se omiten "
-                f"(use --incluir-validadas para forzar su descarga de todas formas)."
-            )
+    if limite:
+        filas = filas[:limite]
+    logger.info(f"Filas a procesar en esta corrida: {len(filas):,} -> '{directorio_destino}'")
 
-    # Clasificar entre ya descargadas en el destino y pendientes
-    pendientes = []
-    ya_existian = 0
-    for f in filas:
-        op_id = sanitizar_op(f["op"]) or "SINOP"
-        rank = f["rank"] if f["rank"] is not None else 0
-        tercero_slug = sanitizar_nombre(f["tercero"])
-        nombre_archivo = f"{int(rank):05d}_OP{op_id}_{tercero_slug}.pdf".replace("__", "_")
-        f["_nombre_archivo"] = nombre_archivo
-        ruta_destino = directorio_destino / nombre_archivo
-        if ruta_destino.exists() and ruta_destino.stat().st_size > 1024:
-            ya_existian += 1
-        else:
-            pendientes.append(f)
-
+    resultados = descargar_filas(filas, directorio_destino, pausa_segundos=pausa_segundos,
+                                 usuario=usuario, contrasena=contrasena, fedauth=fedauth, rtfa=rtfa,
+                                 respaldo_extra=respaldo_extra)
+    stats: Dict[str, Any] = {"total_lote": len(filas), "directorio": str(directorio_destino)}
+    for r in resultados.values():
+        stats[r["estado"]] = stats.get(r["estado"], 0) + 1
+    fallidos = [rank for rank, r in resultados.items() if r["estado"] == "fallido"]
     logger.info("=" * 65)
-    logger.info(f"LOTE: {ruta_excel.name}")
-    logger.info(f" - Ya descargados en '{directorio_destino}': {ya_existian:,}")
-    logger.info(f" - Pendientes de descarga:                  {len(pendientes):,}")
+    logger.info(f"RESUMEN DE DESCARGA: {stats}")
+    if fallidos:
+        logger.warning(f"Ranks SIN PDF tras agotar reintentos ({len(fallidos)}): {fallidos}")
     logger.info("=" * 65)
-
-    if not pendientes:
-        logger.info("[TODO AL DÍA] Todos los soportes de este lote ya están en disco.")
-        return {"total_lote": len(filas), "ya_existian": ya_existian, "descargados": 0,
-                "recuperados_local": 0, "fallidos": 0, "directorio": str(directorio_destino)}
-
-    if limite is not None and limite > 0:
-        lote_a_procesar = pendientes[:limite]
-        logger.info(f"[LOTE PARCIAL] Procesando {len(lote_a_procesar)} de {len(pendientes)} filas pendientes.")
-    else:
-        lote_a_procesar = pendientes
-        logger.info(f"[LOTE COMPLETO] Procesando las {len(lote_a_procesar)} filas pendientes.")
-
-    primer_enlace = lote_a_procesar[0]["url"]
-    parsed_url = urlparse(primer_enlace)
-    dominio_sitio = f"{parsed_url.scheme}://{parsed_url.netloc}"
-
-    session = crear_sesion_autenticada(
-        usuario=usuario, contrasena=contrasena,
-        fedauth_cookie=fedauth, rtfa_cookie=rtfa,
-        dominio_sitio=dominio_sitio,
-    )
-
-    stats = {"total_lote": len(filas), "ya_existian": ya_existian, "descargados": 0,
-              "recuperados_local": 0, "fallidos": 0, "directorio": str(directorio_destino)}
-
-    manifiesto = []
-
-    for pos, f in enumerate(lote_a_procesar, 1):
-        rank = f["rank"]
-        op_id = sanitizar_op(f["op"]) or "SINOP"
-        url = f["url"]
-        nombre_archivo = f["_nombre_archivo"]
-        ruta_archivo_destino = directorio_destino / nombre_archivo
-        monto = f.get("valor")
-        monto_str = f"${abs(monto):,.0f}" if isinstance(monto, (int, float)) else ""
-
-        logger.info(f"[{pos}/{len(lote_a_procesar)}] (rank #{rank} {monto_str}) Descargando OP {op_id}...")
-
-        descarga_exitosa = False
-        estado = "fallido"
-
-        try:
-            resp = session.get(url, timeout=35, allow_redirects=True)
-            if resp.status_code == 200:
-                contenido = resp.content
-                if contenido.startswith(b"%PDF"):
-                    with open(ruta_archivo_destino, "wb") as fh:
-                        fh.write(contenido)
-                    logger.info(f"[OK] rank #{rank} / OP {op_id}: guardado ({len(contenido):,} bytes).")
-                    stats["descargados"] += 1
-                    descarga_exitosa = True
-                    estado = "descargado_web"
-                else:
-                    logger.warning(
-                        f"[AVISO] rank #{rank} / OP {op_id}: código 200 pero el contenido es HTML/Login "
-                        f"(tipo: {resp.headers.get('Content-Type')}). Se requiere autenticación activa."
-                    )
-            elif resp.status_code in (401, 403):
-                logger.warning(f"[ACCESO DENEGADO HTTP {resp.status_code}] rank #{rank} / OP {op_id}: autenticación requerida.")
-            else:
-                logger.error(f"[ERROR HTTP {resp.status_code}] rank #{rank} / OP {op_id} al descargar.")
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"[EXCEPCIÓN DE RED] rank #{rank} / OP {op_id}: {e}")
-
-        if not descarga_exitosa:
-            nombre_origen = Path(unquote(urlparse(url).path)).name
-            if nombre_origen:
-                archivo_local = buscar_respaldo_local(nombre_origen, rutas_respaldo)
-                if archivo_local and archivo_local.exists():
-                    try:
-                        import shutil
-                        shutil.copy2(archivo_local, ruta_archivo_destino)
-                        logger.info(f"[RECUPERADO LOCAL] rank #{rank} / OP {op_id}: copiado desde '{archivo_local.name}'.")
-                        stats["recuperados_local"] += 1
-                        descarga_exitosa = True
-                        estado = "recuperado_local"
-                    except Exception as e_copy:
-                        logger.error(f"Error copiando respaldo local para OP {op_id}: {e_copy}")
-
-        if not descarga_exitosa:
-            stats["fallidos"] += 1
-
-        manifiesto.append({
-            "rank": rank, "fila_universalidad": f.get("fila_universalidad"), "op": f.get("op"),
-            "tercero": f.get("tercero"), "fecha": f.get("fecha"), "valor": f.get("valor"),
-            "moneda": f.get("moneda"), "url": url, "archivo_local": nombre_archivo if descarga_exitosa else "",
-            "estado": estado,
-        })
-
-        time.sleep(pausa_segundos)
-
-    # Escribir manifiesto CSV para trazabilidad (rank/OP -> archivo local)
-    ruta_manifiesto = directorio_destino / "_manifiesto_descarga.csv"
-    modo_escritura = "a" if ruta_manifiesto.exists() else "w"
-    import csv
-    with open(ruta_manifiesto, modo_escritura, newline="", encoding="utf-8-sig") as fh:
-        campos = ["rank", "fila_universalidad", "op", "tercero", "fecha", "valor", "moneda", "url", "archivo_local", "estado"]
-        writer = csv.DictWriter(fh, fieldnames=campos)
-        if modo_escritura == "w":
-            writer.writeheader()
-        writer.writerows(manifiesto)
-
-    logger.info("=" * 65)
-    logger.info("RESUMEN DE DESCARGA DE SOPORTES:")
-    logger.info(f" - Total filas en el lote (tras filtros):  {len(filas):,}")
-    logger.info(f" - Descargadas vía Web:                    {stats['descargados']:,}")
-    logger.info(f" - Ya existentes en disco:                 {stats['ya_existian']:,}")
-    logger.info(f" - Recuperadas de respaldo local:           {stats['recuperados_local']:,}")
-    logger.info(f" - Pendientes / Fallidas:                  {stats['fallidos']:,}")
-    logger.info(f" - Directorio destino:                     {directorio_destino}")
-    logger.info(f" - Manifiesto:                              {ruta_manifiesto}")
-    logger.info("=" * 65)
-
+    stats["ranks_fallidos"] = fallidos
     return stats
 
 
@@ -544,26 +628,24 @@ def main():
         description="Descarga autenticada de soportes PDF a partir de un Excel de validación por lote."
     )
     parser.add_argument("--excel", type=str, required=True,
-                         help="Ruta al archivo Excel de validación por lote (hoja 'Resumen').")
+                        help="Ruta al archivo Excel de validación por lote (hoja 'Resumen').")
     parser.add_argument("--hoja", type=str, default="Resumen", help="Nombre de la hoja con la tabla (default: 'Resumen').")
     parser.add_argument("--destino", type=str, default=None,
-                         help="Carpeta destino de los PDFs (default: ./data/soportes/<nombre_del_excel>/).")
+                        help="Carpeta destino de los PDFs (default: ./data/soportes/<nombre_del_excel>/).")
     parser.add_argument("--usuario", type=str, default=None, help="Usuario o correo de SharePoint / Microsoft 365.")
     parser.add_argument("--password", type=str, default=None, help="Contraseña de SharePoint.")
     parser.add_argument("--fedauth", type=str, default=None, help="Cookie de sesión FedAuth (para cuentas con MFA).")
     parser.add_argument("--rtfa", type=str, default=None, help="Cookie de sesión rtFa (opcional, junto con --fedauth).")
     parser.add_argument("--lote", "--limite", dest="lote", type=int, default=None,
-                         help="Cantidad máxima de filas PENDIENTES a descargar en esta corrida (default: todas).")
+                        help="Cantidad máxima de filas PENDIENTES a descargar en esta corrida (default: todas).")
     parser.add_argument("--pausa", type=float, default=1.0, help="Pausa en segundos entre descargas (default 1.0).")
     parser.add_argument("--incluir-validadas", action="store_true",
-                         help="Descarga también las filas que ya tienen 'Resultado de validación' (por defecto se omiten).")
+                        help="Descarga también las filas que ya tienen 'Resultado de validación' (por defecto se omiten).")
     parser.add_argument("--respaldo", action="append", default=None,
-                         help="Carpeta local adicional donde buscar el PDF antes de ir a la red "
-                              "(por ejemplo, tu biblioteca de SharePoint ya sincronizada con OneDrive). "
-                              "Puede repetirse varias veces.")
+                        help="Carpeta local adicional donde buscar el PDF si la red falla "
+                             "(por ejemplo, tu biblioteca de SharePoint ya sincronizada con OneDrive). "
+                             "Puede repetirse varias veces.")
     args = parser.parse_args()
-
-    respaldo_extra = [Path(p) for p in args.respaldo] if args.respaldo else None
 
     descargar_soportes_desde_excel(
         ruta_excel=Path(args.excel),
@@ -576,7 +658,7 @@ def main():
         contrasena=args.password,
         fedauth=args.fedauth,
         rtfa=args.rtfa,
-        respaldo_extra=respaldo_extra,
+        respaldo_extra=[Path(p) for p in args.respaldo] if args.respaldo else None,
     )
 
 

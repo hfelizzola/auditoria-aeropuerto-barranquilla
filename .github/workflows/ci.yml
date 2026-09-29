@@ -37,13 +37,14 @@ jobs:
 
       - name: Verificar sintaxis de scripts Python (py_compile)
         run: |
-          python -m py_compile src/*.py
+          python -m py_compile src/*.py src/auditoria/*.py
           echo "Todos los scripts en src/ compilan correctamente."
+
+      - name: Pruebas unitarias (reconciliación, layout Excel, reglas duras, orquestador)
+        run: python -m unittest discover -s tests -v
 
       - name: Verificar existencia de estructura de carpetas
         run: |
           test -d data/raw || exit 1
-          test -d data/datalake_pdfs || exit 1
           test -d data/output || exit 1
           echo "Estructura de directorios /data validada."
-

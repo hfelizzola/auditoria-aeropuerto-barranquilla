@@ -1,9 +1,16 @@
+# cryptography (dependencia de google-auth y msal) no publica wheel reciente para
+# Python 3.9 en Mac Intel: forzar binarios evita compilarla con Rust/OpenSSL.
+--only-binary=cryptography
 pandas>=2.0.0
 requests>=2.31.0
-google-generativeai>=0.8.0
-pdf2image>=1.17.0
+openpyxl>=3.1.2
 pillow>=10.0.0
 python-dotenv>=1.0.0
-openpyxl>=3.1.2
 pymupdf>=1.24.0
+pdf2image>=1.17.0
+# Modelos de visión/clasificación (--modelo-vision gemini|claude)
+google-genai>=1.47.0
+anthropic>=0.125.0
 Office365-REST-Python-Client>=2.5.0
+# Opcional: descarga vía Microsoft Graph con flujo de código de dispositivo (GRAPH_CLIENT_ID)
+# msal>=1.28.0

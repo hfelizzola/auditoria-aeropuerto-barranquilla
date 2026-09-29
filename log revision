@@ -1,0 +1,2 @@
+(.venv) hfelizzola@MacBook-Pro-de-Heriberto Auditoria Automatizada % python src/00_orquestar_auditoria.py --modo pareto --desde 7000 --hasta 7500 --tamano-lote 10
+2026-09-26 21:36:37,938 [INFO] UNIVERSALIDAD: 12,826 filas; 10,444 con OP+URL rankeadas.

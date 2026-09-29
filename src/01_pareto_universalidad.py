@@ -11,11 +11,19 @@ Objetivo:
 - Ordenar de mayor a menor y calcular el porcentaje individual y acumulado.
 - Filtrar las transacciones de mayor materialidad (hasta el 80% acumulado / top 1000).
 - Exportar la base resultante a `data/output/base_auditoria_pareto.csv`.
+
+Además expone `rankear_op_url()`, el ranking canónico que usan los lotes de
+validación y el orquestador (00_orquestar_auditoria.py):
+- ordena TODA la población por valor absoluto descendente (orden estable),
+- "Fila UNIVERSALIDAD" = posición en esa población ordenada + 1 (fila 1 = encabezado),
+- "#" (rank) = consecutivo solo entre las filas que tienen NUMERO OP y URL a la vez.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
@@ -50,10 +58,104 @@ def cargar_universalidad(ruta_excel: Path, hoja: str = "UNIVERSALIDAD") -> pd.Da
     df = pd.read_excel(ruta_excel, sheet_name=hoja)
     logger.info(f"Registros leídos inicialmente: {len(df):,}")
 
-    # Limpiar espacios en blanco al inicio/final de los nombres de columnas
-    df.columns = [c.strip() if isinstance(c, str) else str(c) for c in df.columns]
+    # Limpiar espacios al inicio/final y espacios dobles internos de los nombres de columnas
+    # (la hoja trae "  VALOR  DEBITADO O ACREDITADO")
+    df.columns = [" ".join(c.split()) if isinstance(c, str) else str(c) for c in df.columns]
+
+    # Respaldo: si la columna URL no trae enlaces como texto plano, leer los
+    # hipervínculos embebidos de "LINK AL SOPORTE VALIDADO" desde el paquete OOXML.
+    tiene_url_texto = "URL" in df.columns and df["URL"].astype(str).str.match(r"^https?://", case=False).any()
+    if not tiene_url_texto and "LINK AL SOPORTE VALIDADO" in df.columns:
+        df = _completar_url_desde_hipervinculos(df, ruta_excel, hoja)
 
     return df
+
+
+def _completar_url_desde_hipervinculos(df: pd.DataFrame, ruta_excel: Path, hoja: str) -> pd.DataFrame:
+    from openpyxl.utils import column_index_from_string
+    from auditoria.lote_excel import extraer_hipervinculos_xlsx
+
+    logger.info("Columna URL sin enlaces en texto plano: leyendo hipervínculos embebidos del .xlsx...")
+    enlaces = extraer_hipervinculos_xlsx(Path(ruta_excel), hoja)
+    col_link = list(df.columns).index("LINK AL SOPORTE VALIDADO") + 1
+    urls = {}
+    for ref, url in enlaces.items():
+        m = re.match(r"^([A-Z]+)(\d+)$", ref)
+        if m and column_index_from_string(m.group(1)) == col_link:
+            urls[int(m.group(2)) - 2] = url  # fila Excel 2 = índice 0 (fila 1 es encabezado)
+    df = df.copy()
+    df["URL"] = pd.Series(urls, dtype="object").reindex(df.index)
+    logger.info(f"Hipervínculos recuperados: {len(urls):,}")
+    return df
+
+
+def cargar_universalidad_con_cache(ruta_excel: Path, hoja: str = "UNIVERSALIDAD",
+                                   dir_cache: Optional[Path] = None) -> pd.DataFrame:
+    """Igual que cargar_universalidad, pero reutiliza una copia en pickle mientras el
+    .xlsx no cambie (leer las ~12.800 filas toma ~15 s en cada reanudación)."""
+    ruta_excel = Path(ruta_excel)
+    dir_cache = dir_cache or Path(__file__).resolve().parent.parent / "data" / "output" / ".cache"
+    st = ruta_excel.stat()
+    firma = hashlib.sha1(f"{ruta_excel.resolve()}|{st.st_size}|{st.st_mtime_ns}|{hoja}".encode()).hexdigest()[:16]
+    ruta_cache = dir_cache / f"universalidad_{firma}.pkl"
+    if ruta_cache.exists():
+        try:
+            return pd.read_pickle(ruta_cache)
+        except Exception:  # noqa: BLE001 - caché corrupta: se regenera
+            pass
+    df = cargar_universalidad(ruta_excel, hoja)
+    dir_cache.mkdir(parents=True, exist_ok=True)
+    for viejo in dir_cache.glob("universalidad_*.pkl"):
+        viejo.unlink(missing_ok=True)
+    df.to_pickle(ruta_cache)
+    return df
+
+
+def _normalizar_op(valor) -> Optional[str]:
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return None
+    txt = str(valor).strip()
+    if txt.lower() in ("", "nan", "none"):
+        return None
+    m = re.match(r"^0*(\d+)(?:\.0+)?$", txt)
+    return (m.group(1) or "0") if m else txt
+
+
+def moneda_carpeta(url) -> str:
+    """'USD' si alguna carpeta de la ruta del soporte es de dólares ('SOPORTES USD', 'OPEX USD')."""
+    if not isinstance(url, str):
+        return "COP"
+    carpetas = url.split("?")[0].split("/")[:-1]
+    return "USD" if any(re.search(r"\bUSD\b", c.upper()) for c in carpetas) else "COP"
+
+
+def rankear_op_url(df: pd.DataFrame, col_valor: str = "VALOR DEBITADO O ACREDITADO") -> pd.DataFrame:
+    """Ranking canónico de los lotes de validación sobre TODA la población.
+
+    Devuelve la población ordenada con columnas añadidas:
+      FILA_ORIGEN_EXCEL  fila de la hoja UNIVERSALIDAD original (encabezado = fila 1)
+      FILA_UNIVERSALIDAD posición en la población ordenada + 1 (columna 'Fila UNIVERSALIDAD')
+      RANK               consecutivo (#) solo para filas con NUMERO OP y URL; NaN en las demás
+      OP_NORM, VALOR_ABSOLUTO, MONEDA_CARPETA
+    """
+    if col_valor not in df.columns:
+        candidatos = [c for c in df.columns if "DEBITADO" in str(c).upper()]
+        if not candidatos:
+            raise KeyError(f"No se encontró la columna de valor '{col_valor}'.")
+        col_valor = candidatos[0]
+    base = df.copy()
+    base["FILA_ORIGEN_EXCEL"] = range(2, len(base) + 2)
+    base["VALOR_ABSOLUTO"] = pd.to_numeric(base[col_valor], errors="coerce").abs()
+    base = base.sort_values("VALOR_ABSOLUTO", ascending=False, kind="mergesort",
+                            na_position="last").reset_index(drop=True)
+    base["FILA_UNIVERSALIDAD"] = base.index + 2
+    base["OP_NORM"] = base["NUMERO OP"].map(_normalizar_op) if "NUMERO OP" in base.columns else None
+    url = base["URL"] if "URL" in base.columns else pd.Series(index=base.index, dtype="object")
+    tiene = base["OP_NORM"].notna() & url.astype(str).str.match(r"^https?://", case=False)
+    base["RANK"] = pd.Series(pd.NA, index=base.index, dtype="Int64")
+    base.loc[tiene, "RANK"] = range(1, int(tiene.sum()) + 1)
+    base["MONEDA_CARPETA"] = url.map(moneda_carpeta)
+    return base
 
 
 def aplicar_pareto(
