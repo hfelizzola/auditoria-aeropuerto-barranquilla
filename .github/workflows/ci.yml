@@ -46,3 +46,4 @@ jobs:
           test -d data/datalake_pdfs || exit 1
           test -d data/output || exit 1
           echo "Estructura de directorios /data validada."
+

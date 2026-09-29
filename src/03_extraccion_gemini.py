@@ -478,7 +478,7 @@ def procesar_lote_pdfs(
 def main():
     parser = argparse.ArgumentParser(description="Extracción y clasificación multimodal de soportes con Gemini en orden Pareto.")
     parser.add_argument("--modelo", type=str, default=None, help="Nombre del modelo Gemini (ej. gemini-2.5-flash).")
-    parser.add_argument("--lote", "--limite", dest="lote", type=int, default=None, help="Cantidad de PDFs pendientes a procesar en este lote (en orden Pareto).")
+    parser.add_argument("--lote", "--limite", dest="lote", type=int, default=5, help="Cantidad de PDFs pendientes a procesar en este lote (en orden Pareto).")
     args = parser.parse_args()
 
     procesar_lote_pdfs(modelo_nombre=args.modelo, max_archivos=args.lote)

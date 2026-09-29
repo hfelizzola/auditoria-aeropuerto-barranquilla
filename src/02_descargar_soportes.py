@@ -433,7 +433,7 @@ def main():
     parser.add_argument("--usuario", type=str, default=None, help="Usuario o correo de SharePoint / Microsoft 365.")
     parser.add_argument("--password", type=str, default=None, help="Contraseña de SharePoint.")
     parser.add_argument("--fedauth", type=str, default=None, help="Cookie de sesión FedAuth (para cuentas con MFA).")
-    parser.add_argument("--lote", "--limite", dest="lote", type=int, default=None, help="Cantidad de OPs pendientes a descargar en este lote (en orden Pareto).")
+    parser.add_argument("--lote", "--limite", dest="lote", type=int, default=400, help="Cantidad de OPs pendientes a descargar en este lote (en orden Pareto).")
     parser.add_argument("--pausa", type=float, default=1.0, help="Pausa en segundos entre descargas (default 1.0).")
     args = parser.parse_args()
 
